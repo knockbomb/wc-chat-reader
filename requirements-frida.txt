@@ -1,0 +1,6 @@
+# Optional Frida-based key extraction fallback.
+# Requires Windows Administrator or macOS with SIP disabled.
+-r requirements.txt
+
+frida>=16.5.0
+frida-tools>=13.7.0

@@ -1,3 +1,52 @@
+Metadata-Version: 2.4
+Name: wc-chat-reader
+Version: 0.1.0
+Summary: WeChat local chat history reader with HTTP API and MCP integration
+Author: knockbomb
+License: Apache-2.0
+Project-URL: Repository, https://github.com/knockbomb/wc-chat-reader
+Keywords: wechat,chatlog,mcp,sqlcipher
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Operating System :: Microsoft :: Windows
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.115.0
+Requires-Dist: uvicorn[standard]>=0.32.0
+Requires-Dist: pydantic>=2.9.0
+Requires-Dist: pydantic-settings>=2.5.0
+Requires-Dist: sse-starlette>=2.1.0
+Requires-Dist: typer>=0.12.5
+Requires-Dist: rich>=13.9.0
+Requires-Dist: loguru>=0.7.2
+Requires-Dist: pycryptodome>=3.21.0
+Requires-Dist: psutil>=6.1.0
+Requires-Dist: pywin32>=308; sys_platform == "win32"
+Requires-Dist: protobuf>=5.28.0
+Requires-Dist: lz4>=4.3.3
+Requires-Dist: zstandard>=0.23.0
+Requires-Dist: pillow>=11.0.0
+Requires-Dist: httpx>=0.27.0
+Requires-Dist: python-multipart>=0.0.12
+Provides-Extra: frida
+Requires-Dist: frida>=16.5.0; extra == "frida"
+Requires-Dist: frida-tools>=13.7.0; extra == "frida"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.3.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.24.0; extra == "dev"
+Requires-Dist: pytest-cov>=6.0.0; extra == "dev"
+Requires-Dist: pytest-mock>=3.14.0; extra == "dev"
+Requires-Dist: hypothesis>=6.115.0; extra == "dev"
+Requires-Dist: ruff>=0.7.0; extra == "dev"
+Requires-Dist: mypy>=1.13.0; extra == "dev"
+Requires-Dist: types-psutil; extra == "dev"
+Requires-Dist: types-protobuf; extra == "dev"
+
 # WeChat Chat Reader — 微信本地聊天记录读取工具
 
 > **⚠️ 使用前必读**：本工具仅供 **合法研究、个人本地聊天数据分析和授权渗透测试** 使用。

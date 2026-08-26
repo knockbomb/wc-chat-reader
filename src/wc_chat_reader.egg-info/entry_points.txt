@@ -1,0 +1,2 @@
+[console_scripts]
+wcreader = wc_chat_reader.cli.main:app
