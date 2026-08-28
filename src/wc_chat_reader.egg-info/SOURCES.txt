@@ -14,10 +14,12 @@ src/wc_chat_reader/api/main.py
 src/wc_chat_reader/api/schemas.py
 src/wc_chat_reader/api/routes/__init__.py
 src/wc_chat_reader/api/routes/chatlog.py
+src/wc_chat_reader/api/routes/dashboard.py
 src/wc_chat_reader/api/routes/directory.py
 src/wc_chat_reader/api/routes/health.py
 src/wc_chat_reader/api/routes/media.py
 src/wc_chat_reader/cli/__init__.py
+src/wc_chat_reader/cli/__main__.py
 src/wc_chat_reader/cli/main.py
 src/wc_chat_reader/core/__init__.py
 src/wc_chat_reader/core/config.py
