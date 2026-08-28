@@ -79,13 +79,14 @@ def key(
 ) -> None:
     """Extract the WeChat database key from the running process."""
     from wc_chat_reader.key import extract_key
-    from wc_chat_reader.wechat import find_wechat_processes
+    from wc_chat_reader.wechat import find_wechat_processes, select_primary_process
 
     procs = find_wechat_processes()
     if not procs:
         console.print("[red]No WeChat process found.[/red]")
         raise typer.Exit(code=1)
-    proc = next((p for p in procs if p.pid == pid), procs[0]) if pid else procs[0]
+    primary = select_primary_process(procs)
+    proc = next((p for p in procs if p.pid == pid), primary) if pid else primary
 
     console.print(f"Using PID {proc.pid} ({proc.version.name})")
     result = extract_key(proc, sample_db)
@@ -113,14 +114,15 @@ def decrypt(
     """Decrypt WeChat database files into an output directory."""
     from wc_chat_reader.decrypt import create_decryptor
     from wc_chat_reader.key import extract_key
-    from wc_chat_reader.wechat import find_wechat_processes
+    from wc_chat_reader.wechat import find_wechat_processes, select_primary_process
 
     settings = get_settings()
     procs = find_wechat_processes()
     if not procs:
         console.print("[red]No WeChat process found.[/red]")
         raise typer.Exit(code=1)
-    proc = next((p for p in procs if p.pid == pid), procs[0]) if pid else procs[0]
+    primary = select_primary_process(procs)
+    proc = next((p for p in procs if p.pid == pid), primary) if pid else primary
     data = data_dir or proc.data_dir
     if data is None:
         console.print("[red]Could not resolve data directory[/red]")
@@ -193,7 +195,7 @@ def serve(
 
     from wc_chat_reader.api.main import create_app
     from wc_chat_reader.db.repository import Repository
-    from wc_chat_reader.wechat import find_wechat_processes
+    from wc_chat_reader.wechat import find_wechat_processes, select_primary_process
 
     settings = get_settings()
     host = host or settings.http_host
@@ -212,12 +214,29 @@ def serve(
         ver_str = wv.name
         dd_str = str(data_dir)
     else:
-        procs = find_wechat_processes()
-        if procs and procs[0].data_dir:
-            p = procs[0]
-            repository = Repository(data_dir=p.data_dir, version=p.version)
-            ver_str = p.version.name
-            dd_str = str(p.data_dir)
+        # Prefer the decrypted output produced by `wcreader decrypt`, which
+        # is what the README workflow actually serves. Fall back to the raw
+        # (still encrypted) WeChat data dir only as a last resort.
+        decrypted = settings.work_dir / "decrypted"
+        if decrypted.exists() and any(decrypted.rglob("*.db")):
+            wv = _detect_data_dir_version(decrypted)
+            repository = Repository(data_dir=decrypted, version=wv)
+            ver_str = wv.name
+            dd_str = str(decrypted)
+            console.print(f"[green]Serving decrypted data:[/green] {decrypted}")
+        else:
+            procs = find_wechat_processes()
+            if procs:
+                p = select_primary_process(procs)
+                console.print(
+                    "[yellow]Warning: no decrypted data found "
+                    f"({decrypted}).[/yellow]\n"
+                    "[yellow]Serving the RAW (still encrypted) WeChat data dir "
+                    "will return no usable data. Run `wcreader decrypt` first.[/yellow]"
+                )
+                repository = Repository(data_dir=p.data_dir, version=p.version)
+                ver_str = p.version.name
+                dd_str = str(p.data_dir)
 
     app_obj = create_app(
         settings=settings,

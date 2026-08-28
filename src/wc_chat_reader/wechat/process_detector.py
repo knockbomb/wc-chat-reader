@@ -74,14 +74,41 @@ def find_wechat_processes() -> list[WeChatProcess]:
     return results
 
 
-def require_wechat_process() -> WeChatProcess:
-    """Return the first running WeChat process or raise WeChatNotFoundError."""
-    procs = find_wechat_processes()
+def select_primary_process(procs: list[WeChatProcess]) -> WeChatProcess:
+    """Pick the most useful WeChat process out of a discovery result.
+
+    WeChat 4.x spawns multiple processes (one main process plus several
+    helper/sandbox processes). Picking ``procs[0]`` naively can land on a
+    helper process whose version classifies as UNKNOWN, which breaks key
+    extraction and directory detection downstream. Selection priority:
+
+    1. Online (data dir resolvable) with a known V3/V4 version — the main process.
+    2. Any process with a known V3/V4 version.
+    3. Any online process (best effort when version is unknown).
+    4. The first process as a last resort.
+
+    Raises ``WeChatNotFoundError`` if ``procs`` is empty.
+    """
     if not procs:
         raise WeChatNotFoundError(
             "No running WeChat process found. Please launch WeChat and log in."
         )
-    return procs[0]
+
+    def known(p: WeChatProcess) -> bool:
+        return p.version in (WeChatVersion.V3, WeChatVersion.V4)
+
+    return next(
+        (p for p in procs if p.is_online and known(p)),
+        next(
+            (p for p in procs if known(p)),
+            next((p for p in procs if p.is_online), procs[0]),
+        ),
+    )
+
+
+def require_wechat_process() -> WeChatProcess:
+    """Return the primary running WeChat process or raise WeChatNotFoundError."""
+    return select_primary_process(find_wechat_processes())
 
 
 def _iter_wechat_processes() -> Iterator[psutil.Process]:
