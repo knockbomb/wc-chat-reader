@@ -30,6 +30,22 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _resolve_sample_db(process: WeChatProcess, version: object) -> Path | None:
+    """Locate a sample encrypted DB for validators that need one (Frida)."""
+    # Deferred imports avoid a cycle: _memory_base imports scanner/validator,
+    # which do not depend on the pipeline, so this stays cheap and safe.
+    from wc_chat_reader.core.constants import (  # noqa: PLC0415
+        WeChatVersion,
+    )
+    from wc_chat_reader.key._memory_base import (  # noqa: PLC0415
+        _find_sample_db,
+    )
+
+    if isinstance(version, WeChatVersion):
+        return _find_sample_db(process, version)
+    return None
+
+
 @dataclass(slots=True)
 class ExtractionPipeline:
     """Ordered collection of extractors."""
@@ -57,6 +73,9 @@ class ExtractionPipeline:
     ) -> KeyResult:
         errors: list[str] = []
         skipped: list[str] = []
+        # Resolve the sample DB once so every extractor (notably Frida, which
+        # cannot infer it on its own) shares the same validation target.
+        sample = sample_db_path or _resolve_sample_db(process, process.version)
         for extractor in self.extractors:
             reason = extractor.unsupported_reason(process)
             if reason is not None or not extractor.supports(process):
@@ -67,7 +86,7 @@ class ExtractionPipeline:
                 continue
             logger.info(f"Trying {extractor.name}...")
             try:
-                return extractor.extract(process, sample_db_path)
+                return extractor.extract(process, sample)
             except (KeyExtractionError, NoValidKeyError) as exc:
                 logger.warning(f"{extractor.name} failed: {exc}")
                 errors.append(f"{extractor.name}: {exc}")
