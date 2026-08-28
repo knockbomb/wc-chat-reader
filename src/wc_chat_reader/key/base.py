@@ -49,6 +49,17 @@ class KeyExtractor(ABC):
     def supports(self, process: WeChatProcess) -> bool:
         """Return True if this strategy applies to the given process."""
 
+    def unsupported_reason(self, process: WeChatProcess) -> str | None:
+        """Return a human-readable reason the strategy does not apply, or None.
+
+        Used by the pipeline to produce actionable error messages when every
+        strategy is skipped (e.g. "frida is not installed", "process version
+        is UNKNOWN"). Subclasses that implement ``supports`` should override
+        this to explain their rejection. The default delegates to
+        ``supports`` for backward compatibility with third-party extractors.
+        """
+        return None if self.supports(process) else "not applicable to this process"
+
     @abstractmethod
     def extract(
         self,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -43,8 +44,17 @@ class _BaseMemoryExtractor(KeyExtractor):
     _params: _ExtractParams
 
     def supports(self, process: WeChatProcess) -> bool:
-        import sys as _sys
-        return _sys.platform == "win32" and process.version == self._params.version
+        return sys.platform == "win32" and process.version == self._params.version
+
+    def unsupported_reason(self, process: WeChatProcess) -> str | None:
+        if sys.platform != "win32":
+            return "memory scanning requires Windows"
+        if process.version != self._params.version:
+            return (
+                f"process version is {process.version.name}, "
+                f"expected {self._params.version.name}"
+            )
+        return None
 
     def extract(
         self,

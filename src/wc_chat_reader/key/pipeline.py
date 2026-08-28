@@ -56,9 +56,14 @@ class ExtractionPipeline:
         sample_db_path: Path | None = None,
     ) -> KeyResult:
         errors: list[str] = []
+        skipped: list[str] = []
         for extractor in self.extractors:
-            if not extractor.supports(process):
-                logger.debug(f"{extractor.name}: unsupported for this process")
+            reason = extractor.unsupported_reason(process)
+            if reason is not None or not extractor.supports(process):
+                if reason is None:
+                    reason = "not applicable to this process"
+                logger.debug(f"{extractor.name}: skipped ({reason})")
+                skipped.append(f"{extractor.name}: {reason}")
                 continue
             logger.info(f"Trying {extractor.name}...")
             try:
@@ -66,8 +71,14 @@ class ExtractionPipeline:
             except (KeyExtractionError, NoValidKeyError) as exc:
                 logger.warning(f"{extractor.name} failed: {exc}")
                 errors.append(f"{extractor.name}: {exc}")
+        if errors:
+            raise KeyExtractionError(
+                "All extractors failed:\n  - " + "\n  - ".join(errors)
+            )
         raise KeyExtractionError(
-            "All extractors failed:\n  - " + "\n  - ".join(errors)
+            "No extractor supports this WeChat process "
+            f"(version={process.version.name}, pid={process.pid}):\n  - "
+            + "\n  - ".join(skipped)
         )
 
 

@@ -84,6 +84,13 @@ class FridaExtractor(KeyExtractor):
             return False
         return True
 
+    def unsupported_reason(self, process: WeChatProcess) -> str | None:
+        try:
+            import frida  # type: ignore[import-not-found]  # noqa: PLC0415, F401
+        except ImportError:
+            return "frida package is not installed (pip install 'wc-chat-reader[frida]')"
+        return None
+
     def extract(
         self,
         process: WeChatProcess,
