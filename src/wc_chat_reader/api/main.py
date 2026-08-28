@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, AsyncIterator
 from fastapi import FastAPI
 
 from wc_chat_reader.api.deps import AppState
-from wc_chat_reader.api.routes import chatlog, directory, health, media
+from wc_chat_reader.api.routes import chatlog, dashboard, directory, health, media
 from wc_chat_reader.core.config import Settings, get_settings
 from wc_chat_reader.core.constants import VERSION
 from wc_chat_reader.core.exceptions import ConfigError
@@ -77,6 +77,7 @@ def create_app(
         data_dir=data_dir,
     )
 
+    app.include_router(dashboard.router)
     app.include_router(health.router)
     app.include_router(chatlog.router)
     app.include_router(directory.router)
