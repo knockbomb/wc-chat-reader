@@ -162,7 +162,7 @@ def extract_key(
     """
     from wc_chat_reader.key.key_cache import CachedKey, KeyCache
 
-    cache = KeyCache.load()
+    cache = KeyCache()
     cached = cache.get(process.version_str, process.data_dir)
     if cached is not None:
         logger.info(f"extract_key: cache hit (strategy={cached.strategy})")
