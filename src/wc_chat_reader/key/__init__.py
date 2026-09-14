@@ -13,12 +13,15 @@ still works:
 """
 
 from wc_chat_reader.key.base import KeyCandidate, KeyExtractor, KeyResult
+from wc_chat_reader.key.key_cache import CachedKey, KeyCache
 from wc_chat_reader.key.pipeline import ExtractionPipeline, extract_key
 from wc_chat_reader.key.validator import KeyValidator
 
 __all__ = [
+    "CachedKey",
     "ExtractionPipeline",
     "KeyCandidate",
+    "KeyCache",
     "KeyExtractor",
     "KeyResult",
     "KeyValidator",

@@ -34,45 +34,52 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# JavaScript instrumentation injected into the target process. Hooks
-# `sqlite3_key` and `sqlite3_key_v2`, captures the pKey argument (32 bytes),
-# and emits it back to Python via `send()`.
+# JavaScript instrumentation injected into the target process.
 #
-# We deliberately log every step: if neither symbol is exported (common when
-# SQLCipher is statically linked into Weixin.exe, as in WeChat 4.1.13+), we
-# surface that loudly instead of silently waiting for a timeout that will
-# never fire.
+# WeChat 4.x loads its SQLCipher build inside a WeChat DLL (e.g. a module
+# whose name contains "mm" / "xweb" / "wechat"), not necessarily the main
+# executable. We therefore hook `sqlite3_key`/`sqlite3_key_v2` in **every**
+# already-loaded module via Module.enumerateExports — not just the default
+# namespace — and log exactly where each symbol was found so that a "silent
+# 30s timeout" becomes an explicit, debuggable signal.
 _FRIDA_SCRIPT = r"""
 (function () {
-    function hookOnce(name) {
-        const addr = Module.findExportByName(null, name);
-        if (!addr) {
-            send({tag: 'diag', message: name + ' not exported'});
-            return false;
-        }
-        Interceptor.attach(addr, {
-            onEnter: function (args) {
-                // sqlite3_key(sqlite3*, const void *pKey, int nKey)
-                //                       args[1]         args[2]
-                try {
-                    const nKey = args[2].toInt32();
-                    send({tag: 'call', source: name, nKey: nKey});
-                    if (nKey === 32) {
-                        const bytes = Memory.readByteArray(args[1], 32);
-                        send({tag: 'key', source: name}, bytes);
+    var hookedCount = 0;
+    var modules = Process.enumerateModules();
+    send({tag: 'diag', message: 'modules=' + modules.length});
+
+    modules.forEach(function (m) {
+        ['sqlite3_key', 'sqlite3_key_v2'].forEach(function (name) {
+            var addr = null;
+            try { addr = Module.findExportByName(m.name, name); } catch (e) {}
+            if (!addr) return;
+            try {
+                Interceptor.attach(addr, {
+                    onEnter: function (args) {
+                        try {
+                            var nKey = args[2].toInt32();
+                            send({tag: 'call', source: m.name + '!' + name, nKey: nKey});
+                            if (nKey === 32) {
+                                var bytes = Memory.readByteArray(args[1], 32);
+                                send({tag: 'key', source: m.name + '!' + name}, bytes);
+                            }
+                        } catch (e) {
+                            send({tag: 'error', message: e.message});
+                        }
                     }
-                } catch (e) {
-                    send({tag: 'error', message: e.message});
-                }
+                });
+                hookedCount += 1;
+                send({tag: 'hooked', name: m.name + '!' + name});
+            } catch (e) {
+                send({tag: 'error', message: 'attach ' + m.name + '!' + name + ': ' + e.message});
             }
         });
-        send({tag: 'hooked', name: name});
-        return true;
-    }
-    const ok1 = hookOnce('sqlite3_key');
-    const ok2 = hookOnce('sqlite3_key_v2');
-    if (!ok1 && !ok2) {
-        send({tag: 'fatal', message: 'neither sqlite3_key nor sqlite3_key_v2 is exported'});
+    });
+
+    if (hookedCount === 0) {
+        send({tag: 'fatal', message: 'no sqlite3_key export found in any module'});
+    } else {
+        send({tag: 'ready', hooked: hookedCount});
     }
 })();
 """
@@ -104,6 +111,9 @@ class FridaExtractor(KeyExtractor):
             return "frida package is not installed (pip install 'wc-chat-reader[frida]')"
         return None
 
+    # Wait up to this long for the injected script to report `ready`/`fatal`.
+    _READY_TIMEOUT_S = 10.0
+
     def extract(
         self,
         process: WeChatProcess,
@@ -124,6 +134,7 @@ class FridaExtractor(KeyExtractor):
         validator = KeyValidator(sample_db_path, process.version)
 
         key_holder: dict[str, bytes] = {}
+        ready = threading.Event()
         no_export = threading.Event()
         done = threading.Event()
 
@@ -134,9 +145,12 @@ class FridaExtractor(KeyExtractor):
                 if validator.validate(data):
                     key_holder["key"] = data
                     done.set()
+            elif tag == "ready":
+                logger.info(f"FridaExtractor: hooked {payload.get('hooked')} export(s)")
+                ready.set()
             elif tag == "fatal":
-                # Symbols not exported — bail out immediately instead of
-                # waiting out the full timeout for a call that never comes.
+                # No module exports sqlite3_key — bail out immediately instead
+                # of waiting out the full timeout for a call that never comes.
                 no_export.set()
                 done.set()
             elif tag in ("hooked", "diag", "call"):
@@ -155,23 +169,36 @@ class FridaExtractor(KeyExtractor):
             script = session.create_script(_FRIDA_SCRIPT)
             script.on("message", on_message)
             script.load()
+            # Wait for the script to either confirm it hooked something
+            # (`ready`) or report that no module exports the symbol (`fatal`).
+            done.wait(timeout=self._READY_TIMEOUT_S)
+            if no_export.is_set():
+                raise NoValidKeyError(
+                    "FridaExtractor: no module in the target process exports "
+                    f"sqlite3_key/sqlite3_key_v2 (pid={process.pid}). WeChat "
+                    "4.1.13+ statically links SQLCipher, so this hook strategy "
+                    "cannot work on this build — the V4 memory scanner needs "
+                    "an updated pattern instead."
+                )
+            if not ready.is_set():
+                # Neither ready nor fatal arrived — the script itself may have
+                # failed to load. Surface that rather than burning 30 more sec.
+                raise NoValidKeyError(
+                    f"FridaExtractor: script produced no 'ready' signal within "
+                    f"{self._READY_TIMEOUT_S}s; hooking likely failed. Re-run "
+                    "with `-v` to see the injected script's diagnostics."
+                )
+            # Hooks are live: wait for an actual key capture.
             done.wait(timeout=self._timeout_s)
         finally:
             with _SuppressFridaErrors():
                 session.detach()
 
-        if no_export.is_set():
-            raise NoValidKeyError(
-                "FridaExtractor: neither sqlite3_key nor sqlite3_key_v2 is "
-                f"exported by the process (pid={process.pid}). WeChat 4.1.13+ "
-                "links SQLCipher statically, so this hook strategy cannot work "
-                "on this build — the V4 memory scanner needs an updated "
-                "pattern instead."
-            )
         if "key" not in key_holder:
             raise NoValidKeyError(
-                f"FridaExtractor: no valid key seen within {self._timeout_s}s. "
-                "Try interacting with WeChat to trigger a database open."
+                f"FridaExtractor: hooks were live but no valid key was seen "
+                f"within {self._timeout_s}s. Interact with WeChat (open a "
+                "chat, browse Moments) to force a database open, then retry."
             )
         return KeyResult(
             key=key_holder["key"],

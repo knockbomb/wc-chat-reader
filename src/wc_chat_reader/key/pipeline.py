@@ -20,6 +20,7 @@ from wc_chat_reader.core.exceptions import (
 from wc_chat_reader.core.logger import get_logger
 from wc_chat_reader.key.frida_extractor import FridaExtractor
 from wc_chat_reader.key.v3_extractor import V3MemoryExtractor
+from wc_chat_reader.key.v4_codec_extractor import V4CodecExtractor
 from wc_chat_reader.key.v4_extractor import V4MemoryExtractor
 
 if TYPE_CHECKING:
@@ -58,7 +59,7 @@ class ExtractionPipeline:
         """Return the pipeline built from the shipped extractors."""
         return cls(
             extractors=sorted(
-                [V3MemoryExtractor(), V4MemoryExtractor(), FridaExtractor()],
+                [V3MemoryExtractor(), V4MemoryExtractor(), V4CodecExtractor(), FridaExtractor()],
                 key=lambda e: e.priority,
             )
         )
@@ -106,5 +107,38 @@ def extract_key(
     process: WeChatProcess,
     sample_db_path: Path | None = None,
 ) -> KeyResult:
-    """Convenience entry point: run the default pipeline."""
-    return ExtractionPipeline.default().run(process, sample_db_path)
+    """Run the default pipeline, preferring a locally cached key.
+
+    The cache provides an instant "open-and-go" result on subsequent runs
+    for the same WeChat version + data directory, avoiding a repeat of the
+    slow in-memory scan or an extra Frida attach. The cache only accelerates
+    the lookup; the authoritative source stays the live pipeline, which
+    re-validates the captured key against a real database page before we
+    ever persist it.
+    """
+    from wc_chat_reader.key.key_cache import CachedKey, KeyCache
+
+    cache = KeyCache.load()
+    cached = cache.get(process.version_str, process.data_dir)
+    if cached is not None:
+        logger.info(f"extract_key: cache hit (strategy={cached.strategy})")
+        return KeyResult(
+            key=cached.key,
+            strategy=f"{cached.strategy}(cached)",
+            meta={"cached": "true", "captured_at": str(cached.captured_at)},
+        )
+
+    result = ExtractionPipeline.default().run(process, sample_db_path)
+
+    if process.data_dir:
+        from wc_chat_reader.key.key_cache import _fingerprint
+
+        cache.put(
+            CachedKey(
+                key=result.key,
+                version_str=process.version_str,
+                data_dir_fingerprint=_fingerprint(process.data_dir),
+                strategy=result.strategy,
+            )
+        )
+    return result
