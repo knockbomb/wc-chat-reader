@@ -6,6 +6,13 @@ library itself makes when unlocking the database, this technique is largely
 immune to WeChat's memory-layout changes — it will keep working as long as
 WeChat keeps using the SQLCipher library.
 
+**Auto-trigger**: after the hooks are installed, the injected script looks
+for an exported ``sqlite3_open`` / ``sqlite3_open_v2`` and calls it on the
+sample database, forcing WeChat's SQLCipher layer to invoke
+``sqlite3_key`` immediately.  This removes the need for the user to
+manually interact with WeChat (open a chat, browse Moments, …) while the
+hook is waiting.
+
 Requires the optional ``frida`` extra:
 
     pip install -e '.[frida]'
@@ -42,13 +49,19 @@ logger = get_logger(__name__)
 # already-loaded module via Module.enumerateExports — not just the default
 # namespace — and log exactly where each symbol was found so that a "silent
 # 30s timeout" becomes an explicit, debuggable signal.
+#
+# Additionally we locate an exported `sqlite3_open`/`sqlite3_open_v2` so the
+# Python side can trigger a database open and force the key hook to fire.
 _FRIDA_SCRIPT = r"""
 (function () {
     var hookedCount = 0;
+    var openFn = null;
+    var openFnName = null;
     var modules = Process.enumerateModules();
     send({tag: 'diag', message: 'modules=' + modules.length});
 
     modules.forEach(function (m) {
+        // --- Hook sqlite3_key / sqlite3_key_v2 (key capture) ------------
         ['sqlite3_key', 'sqlite3_key_v2'].forEach(function (name) {
             var addr = null;
             try { addr = Module.findExportByName(m.name, name); } catch (e) {}
@@ -74,13 +87,48 @@ _FRIDA_SCRIPT = r"""
                 send({tag: 'error', message: 'attach ' + m.name + '!' + name + ': ' + e.message});
             }
         });
+
+        // --- Locate sqlite3_open for auto-trigger -----------------------
+        if (!openFn) {
+            ['sqlite3_open_v2', 'sqlite3_open'].forEach(function (name) {
+                if (openFn) return;
+                var addr = null;
+                try { addr = Module.findExportByName(m.name, name); } catch (e) {}
+                if (addr) {
+                    openFn = new NativeFunction(addr, 'int', ['pointer', 'int']);
+                    openFnName = m.name + '!' + name;
+                    send({tag: 'diag', message: 'found ' + name + ' in ' + m.name});
+                }
+            });
+        }
     });
 
     if (hookedCount === 0) {
         send({tag: 'fatal', message: 'no sqlite3_key export found in any module'});
-    } else {
-        send({tag: 'ready', hooked: hookedCount});
+        return;
     }
+
+    // Export helpers for the Python side.
+    rpc.exports = {
+        getOpenFnName: function () { return openFnName || ''; },
+        triggerOpen: function (dbPathUtf8) {
+            if (!openFn) return -1;
+            // sqlite3_open(path: const char*, dbOut: sqlite3**)
+            // Allocate space for the output pointer.
+            var dbOut = Memory.alloc(Process.pointerSize);
+            var pathPtr = Memory.allocUtf8String(dbPathUtf8);
+            try {
+                var rc = openFn(pathPtr, dbOut);
+                send({tag: 'diag', message: 'sqlite3_open rc=' + rc});
+                return rc;
+            } catch (e) {
+                send({tag: 'error', message: 'triggerOpen: ' + e.message});
+                return -1;
+            }
+        },
+    };
+
+    send({tag: 'ready', hooked: hookedCount, hasOpen: !!openFn, openName: openFnName || ''});
 })();
 """
 
@@ -91,8 +139,13 @@ class FridaExtractor(KeyExtractor):
     name = "frida-sqlite3_key"
     priority = 50  # Only runs if faster memory scanners fail
 
-    def __init__(self, timeout_s: float = 30.0) -> None:
+    def __init__(
+        self,
+        timeout_s: float = 30.0,
+        auto_trigger: bool = True,
+    ) -> None:
         self._timeout_s = timeout_s
+        self._auto_trigger = auto_trigger
 
     def supports(self, process: WeChatProcess) -> bool:
         try:
@@ -146,7 +199,12 @@ class FridaExtractor(KeyExtractor):
                     key_holder["key"] = data
                     done.set()
             elif tag == "ready":
-                logger.info(f"FridaExtractor: hooked {payload.get('hooked')} export(s)")
+                has_open = payload.get("hasOpen", False)
+                open_name = payload.get("openName", "")
+                logger.info(
+                    f"FridaExtractor: hooked {payload.get('hooked')} export(s)"
+                    + (f", sqlite3_open found ({open_name})" if has_open else ", no sqlite3_open export")
+                )
                 ready.set()
             elif tag == "fatal":
                 # No module exports sqlite3_key — bail out immediately instead
@@ -188,8 +246,38 @@ class FridaExtractor(KeyExtractor):
                     f"{self._READY_TIMEOUT_S}s; hooking likely failed. Re-run "
                     "with `-v` to see the injected script's diagnostics."
                 )
-            # Hooks are live: wait for an actual key capture.
-            done.wait(timeout=self._timeout_s)
+
+            # --- Auto-trigger: call sqlite3_open to force key capture -----
+            if self._auto_trigger and not done.is_set():
+                open_name = ""
+                try:
+                    open_name = script.exports_sync.get_open_fn_name()
+                except Exception:
+                    pass
+                if open_name:
+                    logger.info(
+                        f"FridaExtractor: auto-trigger via {open_name} "
+                        f"on {sample_db_path}"
+                    )
+                    try:
+                        rc = script.exports_sync.trigger_open(str(sample_db_path))
+                        logger.debug(f"FridaExtractor: sqlite3_open rc={rc}")
+                    except Exception as exc:
+                        logger.warning(
+                            f"FridaExtractor: auto-trigger call failed: {exc}"
+                        )
+                    # Give the hook a short window to capture the key.
+                    done.wait(timeout=5.0)
+
+            # Final wait: either auto-trigger already got the key, or we
+            # fall back to waiting for natural WeChat DB activity.
+            if "key" not in key_holder:
+                remaining = self._timeout_s
+                if self._auto_trigger:
+                    # Auto-trigger already waited ~5s; reduce the natural
+                    # wait accordingly so total time stays bounded.
+                    remaining = max(5.0, self._timeout_s - 5.0)
+                done.wait(timeout=remaining)
         finally:
             with _SuppressFridaErrors():
                 session.detach()

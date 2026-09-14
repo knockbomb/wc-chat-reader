@@ -71,6 +71,11 @@ class _BaseMemoryExtractor(KeyExtractor):
         validator = KeyValidator(db_path, self._params.version)
         candidates_scanned = 0
 
+        logger.info(
+            f"{self.name}: starting memory scan "
+            f"(pid={process.pid}, pattern={self._params.pattern.hex()}, "
+            f"sample_db={db_path})"
+        )
         with open_scanner(process.pid) as scanner:
             for candidate in self._iter_candidates(scanner):
                 candidates_scanned += 1
@@ -94,14 +99,85 @@ class _BaseMemoryExtractor(KeyExtractor):
     def _iter_candidates(
         self, scanner: WindowsMemoryScanner
     ) -> Iterator[bytes]:
-        """Yield 32-byte candidate keys extracted from process memory."""
+        """Yield 32-byte candidate keys extracted from process memory.
+
+        Three optimisations over the naive full-address-space scan:
+
+        1. **Chunked reads** — instead of pulling an entire region (which can
+           be hundreds of MB) into memory at once, we read it in 4 MB chunks.
+           This keeps memory pressure low and lets us bail out early once the
+           total I/O budget is exhausted.
+        2. **RW-first ordering** — heap regions (PAGE_READWRITE /
+           PAGE_WRITECOPY) are where the AES key lives; executable regions
+           almost never contain it.  Scanning RW regions first finds the key
+           sooner in the common case.
+        3. **I/O budget cap** — we stop after reading ~512 MB total, which
+           covers every realistic WeChat heap while preventing a runaway scan
+           on pathological address spaces.
+        """
         pattern = self._params.pattern
         ptr_size = self._params.ptr_size
+
+        # --- Tunables --------------------------------------------------
+        _CHUNK = 4 * 1024 * 1024          # 4 MB per ReadProcessMemory call
+        _OVERLAP = max(256, len(pattern)) # overlap so patterns straddling
+                                          # chunk boundaries are not missed
+        _MAX_BYTES = 512 * 1024 * 1024    # 512 MB total I/O budget
+        # ----------------------------------------------------------------
+
+        # Collect regions and partition by protection: RW/WC first (heap),
+        # then everything else.  VirtualQueryEx is cheap; the real cost is
+        # ReadProcessMemory, which we cap via _MAX_BYTES below.
+        rw_regions: list = []
+        other_regions: list = []
         for region in scanner.iter_regions(min_size=1024 * 1024):
-            data = scanner.read(region.base, region.size)
-            if data is None:
-                continue
-            yield from self._scan_region(scanner, data, pattern, ptr_size)
+            if region.protect & (0x04 | 0x08):  # RW or WRITECOPY
+                rw_regions.append(region)
+            else:
+                other_regions.append(region)
+
+        total_read = 0
+
+        def _scan_chunk(data: bytes, offset_in_region: int) -> Iterator[bytes]:
+            """Scan one chunk's worth of data, yielding candidate keys."""
+            nonlocal total_read
+            total_read += len(data)
+            idx = len(data)
+            while True:
+                idx = data.rfind(pattern, 0, idx)
+                if idx == -1 or idx - ptr_size < 0:
+                    break
+                (ptr,) = struct.unpack_from("<Q", data, idx - ptr_size)
+                if MIN_PTR < ptr < MAX_PTR:
+                    key = scanner.read(ptr, SQLCIPHER_KEY_SIZE)
+                    if key is not None and len(key) == SQLCIPHER_KEY_SIZE:
+                        yield key
+                idx -= 1
+
+        for region in (*rw_regions, *other_regions):
+            if total_read >= _MAX_BYTES:
+                logger.debug(
+                    f"{self.name}: I/O budget exhausted "
+                    f"({total_read / 1024 / 1024:.0f} MB read)"
+                )
+                return
+            pos = 0
+            while pos < region.size:
+                if total_read >= _MAX_BYTES:
+                    return
+                end = min(pos + _CHUNK, region.size)
+                chunk = scanner.read(region.base + pos, end - pos)
+                if chunk is None:
+                    pos = end
+                    continue
+                yield from _scan_chunk(chunk, pos)
+                # Advance by (chunk - overlap) so the next read covers the
+                # tail of this chunk, catching patterns that straddle the
+                # boundary.  On the last chunk just finish the region.
+                if end < region.size:
+                    pos = end - _OVERLAP
+                else:
+                    pos = end
 
     @staticmethod
     def _scan_region(

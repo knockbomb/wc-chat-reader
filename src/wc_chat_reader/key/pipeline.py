@@ -4,12 +4,15 @@ The pipeline embodies the "adaptability first" design:
 
 - Multiple strategies are tried until one succeeds.
 - Strategies are ordered by priority; fast/specific ones run first.
+- The order is dynamically re-arranged per-process so that version-matching
+  extractors always run before generic fallbacks.
 - Users can inject their own extractors (e.g., updated pattern for a new
   WeChat build) without modifying library code.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -48,6 +51,19 @@ def _resolve_sample_db(process: WeChatProcess, version: object) -> Path | None:
     return None
 
 
+def _version_sort_key(
+    extractor: KeyExtractor, process: WeChatProcess
+) -> tuple[int, int]:
+    """Sort key: version-matching extractors first, then by declared priority.
+
+    Returns ``(match, priority)`` where *match* is 0 for extractors that
+    support this process and 1 for those that don't.  Python's stable sort
+    keeps the original priority order within each group.
+    """
+    match = 0 if extractor.supports(process) else 1
+    return (match, extractor.priority)
+
+
 @dataclass(slots=True)
 class ExtractionPipeline:
     """Ordered collection of extractors."""
@@ -59,7 +75,12 @@ class ExtractionPipeline:
         """Return the pipeline built from the shipped extractors."""
         return cls(
             extractors=sorted(
-                [V3MemoryExtractor(), V4MemoryExtractor(), V4CodecExtractor(), FridaExtractor()],
+                [
+                    V3MemoryExtractor(),
+                    V4MemoryExtractor(),
+                    V4CodecExtractor(auto_trigger=True),
+                    FridaExtractor(auto_trigger=True),
+                ],
                 key=lambda e: e.priority,
             )
         )
@@ -78,19 +99,42 @@ class ExtractionPipeline:
         # Resolve the sample DB once so every extractor (notably Frida, which
         # cannot infer it on its own) shares the same validation target.
         sample = sample_db_path or _resolve_sample_db(process, process.version)
-        for extractor in self.extractors:
+
+        # Dynamically reorder: version-matching extractors run first, then
+        # fallbacks.  Within each group the original priority is preserved.
+        ordered = sorted(self.extractors, key=lambda e: _version_sort_key(e, process))
+
+        logger.info(
+            f"ExtractionPipeline: {len(self.extractors)} extractor(s), "
+            f"process version={process.version.name} "
+            f"(pid={process.pid}, version_str={process.version_str!r})"
+        )
+        for idx, extractor in enumerate(ordered, 1):
             reason = extractor.unsupported_reason(process)
             if reason is not None or not extractor.supports(process):
                 if reason is None:
                     reason = "not applicable to this process"
-                logger.debug(f"{extractor.name}: skipped ({reason})")
+                logger.info(
+                    f"  [{idx}/{len(ordered)}] {extractor.name}: "
+                    f"skipped ({reason})"
+                )
                 skipped.append(f"{extractor.name}: {reason}")
                 continue
-            logger.info(f"Trying {extractor.name}...")
+            logger.info(f"  [{idx}/{len(ordered)}] Trying {extractor.name}...")
+            t0 = time.monotonic()
             try:
-                return extractor.extract(process, sample)
+                result = extractor.extract(process, sample)
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    f"  ✓ {extractor.name} succeeded in {elapsed:.1f}s "
+                    f"(strategy={result.strategy})"
+                )
+                return result
             except (KeyExtractionError, NoValidKeyError) as exc:
-                logger.warning(f"{extractor.name} failed: {exc}")
+                elapsed = time.monotonic() - t0
+                logger.warning(
+                    f"  ✗ {extractor.name} failed after {elapsed:.1f}s: {exc}"
+                )
                 errors.append(f"{extractor.name}: {exc}")
         if errors:
             raise KeyExtractionError(

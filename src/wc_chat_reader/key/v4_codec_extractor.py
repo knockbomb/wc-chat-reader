@@ -177,8 +177,13 @@ class V4CodecExtractor(KeyExtractor):
     name = "frida-codec-hook"
     priority = 20  # Below in-memory V4 scan (10), above FridaExtractor (50).
 
-    def __init__(self, timeout_s: float = 30.0) -> None:
+    def __init__(
+        self,
+        timeout_s: float = 30.0,
+        auto_trigger: bool = True,
+    ) -> None:
         self._timeout_s = timeout_s
+        self._auto_trigger = auto_trigger
 
     @staticmethod
     def _frida_available() -> bool:
@@ -267,8 +272,59 @@ class V4CodecExtractor(KeyExtractor):
                 raise NoValidKeyError(
                     "V4CodecExtractor: script produced no 'ready' signal within 15s"
                 )
-            # Hooks are live: wait for an actual key capture.
-            done.wait(timeout=self._timeout_s)
+
+            # --- Auto-trigger: try sqlite3_open to force codec call -------
+            # Unlike FridaExtractor, the codec hook is on an internal function
+            # so we can't call it directly.  But if any module exports
+            # sqlite3_open, calling it will still route through the codec
+            # setup path and fire our hook.
+            if self._auto_trigger and not done.is_set():
+                trigger_script = session.create_script(r"""
+                    rpc.exports = {
+                        findAndCallOpen: function (dbPath) {
+                            var fn = null;
+                            Process.enumerateModules().forEach(function (m) {
+                                if (fn) return;
+                                ['sqlite3_open_v2', 'sqlite3_open'].forEach(function (name) {
+                                    if (fn) return;
+                                    var addr = null;
+                                    try { addr = Module.findExportByName(m.name, name); } catch (e) {}
+                                    if (addr) {
+                                        fn = new NativeFunction(addr, 'int', ['pointer', 'int']);
+                                        send({tag: 'diag', message: 'found ' + name + ' in ' + m.name});
+                                    }
+                                });
+                            });
+                            if (!fn) return -2;
+                            var dbOut = Memory.alloc(Process.pointerSize);
+                            var pathPtr = Memory.allocUtf8String(dbPath);
+                            try { return fn(pathPtr, dbOut); }
+                            catch (e) { send({tag: 'error', message: 'trigger: ' + e.message}); return -1; }
+                        },
+                    };
+                """)
+                trigger_script.on("message", lambda msg, data: logger.debug(f"V4Codec trigger: {msg.get('payload', {})}"))
+                trigger_script.load()
+                try:
+                    rc = trigger_script.exports_sync.find_and_call_open(str(sample_db_path))
+                    logger.info(f"V4CodecExtractor: auto-trigger sqlite3_open rc={rc}")
+                except Exception as exc:
+                    logger.debug(f"V4CodecExtractor: auto-trigger not available ({exc})")
+                finally:
+                    try:
+                        trigger_script.unload()
+                    except Exception:
+                        pass
+                # Brief window for the codec hook to fire.
+                done.wait(timeout=5.0)
+
+            # Final wait: either auto-trigger got the key, or fall back to
+            # natural WeChat DB activity.
+            if "key" not in key_holder:
+                remaining = self._timeout_s
+                if self._auto_trigger:
+                    remaining = max(5.0, self._timeout_s - 5.0)
+                done.wait(timeout=remaining)
         finally:
             try:
                 session.detach()
