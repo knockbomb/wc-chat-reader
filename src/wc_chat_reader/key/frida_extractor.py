@@ -248,6 +248,7 @@ class FridaExtractor(KeyExtractor):
                 )
 
             # --- Auto-trigger: call sqlite3_open to force key capture -----
+            trigger_ok = False
             if self._auto_trigger and not done.is_set():
                 open_name = ""
                 try:
@@ -262,21 +263,29 @@ class FridaExtractor(KeyExtractor):
                     try:
                         rc = script.exports_sync.trigger_open(str(sample_db_path))
                         logger.debug(f"FridaExtractor: sqlite3_open rc={rc}")
+                        trigger_ok = rc >= 0
                     except Exception as exc:
                         logger.warning(
                             f"FridaExtractor: auto-trigger call failed: {exc}"
                         )
-                    # Give the hook a short window to capture the key.
-                    done.wait(timeout=5.0)
+                    if trigger_ok:
+                        # Give the hook a short window to capture the key.
+                        done.wait(timeout=5.0)
+                else:
+                    logger.info(
+                        "FridaExtractor: no sqlite3_open export found — "
+                        "please interact with WeChat to trigger key capture..."
+                    )
 
             # Final wait: either auto-trigger already got the key, or we
             # fall back to waiting for natural WeChat DB activity.
             if "key" not in key_holder:
                 remaining = self._timeout_s
-                if self._auto_trigger:
-                    # Auto-trigger already waited ~5s; reduce the natural
-                    # wait accordingly so total time stays bounded.
+                if trigger_ok:
+                    # Auto-trigger already waited ~5s; reduce accordingly.
                     remaining = max(5.0, self._timeout_s - 5.0)
+                else:
+                    remaining = max(15.0, self._timeout_s)
                 done.wait(timeout=remaining)
         finally:
             with _SuppressFridaErrors():

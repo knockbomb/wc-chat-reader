@@ -278,6 +278,7 @@ class V4CodecExtractor(KeyExtractor):
             # so we can't call it directly.  But if any module exports
             # sqlite3_open, calling it will still route through the codec
             # setup path and fire our hook.
+            trigger_ok = False
             if self._auto_trigger and not done.is_set():
                 trigger_script = session.create_script(r"""
                     rpc.exports = {
@@ -308,6 +309,7 @@ class V4CodecExtractor(KeyExtractor):
                 try:
                     rc = trigger_script.exports_sync.find_and_call_open(str(sample_db_path))
                     logger.info(f"V4CodecExtractor: auto-trigger sqlite3_open rc={rc}")
+                    trigger_ok = rc >= 0
                 except Exception as exc:
                     logger.debug(f"V4CodecExtractor: auto-trigger not available ({exc})")
                 finally:
@@ -315,15 +317,26 @@ class V4CodecExtractor(KeyExtractor):
                         trigger_script.unload()
                     except Exception:
                         pass
-                # Brief window for the codec hook to fire.
-                done.wait(timeout=5.0)
+                if trigger_ok:
+                    # Brief window for the codec hook to fire.
+                    done.wait(timeout=5.0)
+                else:
+                    logger.info(
+                        "V4CodecExtractor: sqlite3_open not exported — "
+                        "please interact with WeChat (open a chat, scroll "
+                        "Moments) to trigger a database open..."
+                    )
 
             # Final wait: either auto-trigger got the key, or fall back to
             # natural WeChat DB activity.
             if "key" not in key_holder:
                 remaining = self._timeout_s
-                if self._auto_trigger:
+                if trigger_ok:
+                    # Auto-trigger already waited ~5s; reduce accordingly.
                     remaining = max(5.0, self._timeout_s - 5.0)
+                else:
+                    # No auto-trigger; use full timeout for user interaction.
+                    remaining = max(15.0, self._timeout_s)
                 done.wait(timeout=remaining)
         finally:
             try:

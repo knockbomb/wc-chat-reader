@@ -16,6 +16,7 @@ class V4MemoryExtractor(_BaseMemoryExtractor):
 
     name = "v4-memory-scan"
     priority = 10
+    _rw_only = True  # V4 keys are always in heap; skip non-RW regions.
 
     _params = _ExtractParams(
         version=WeChatVersion.V4,

@@ -154,7 +154,16 @@ class _BaseMemoryExtractor(KeyExtractor):
                         yield key
                 idx -= 1
 
-        for region in (*rw_regions, *other_regions):
+        logger.debug(
+            f"{self.name}: {len(rw_regions)} RW region(s), "
+            f"{len(other_regions)} other region(s)"
+            f"{', rw_only=True' if getattr(self, '_rw_only', False) else ''}"
+        )
+        # V4 keys live exclusively in heap (RW) regions.  Scanning executable
+        # or read-only regions wastes time and produces false-positive pattern
+        # matches that don't validate.  Skip them entirely.
+        scan_regions = rw_regions if getattr(self, '_rw_only', False) else (*rw_regions, *other_regions)
+        for region in scan_regions:
             if total_read >= _MAX_BYTES:
                 logger.debug(
                     f"{self.name}: I/O budget exhausted "
