@@ -274,16 +274,19 @@ class V4CodecExtractor(KeyExtractor):
                 )
 
             # --- Auto-trigger: try sqlite3_open to force codec call -------
-            # Unlike FridaExtractor, the codec hook is on an internal function
-            # so we can't call it directly.  But if any module exports
-            # sqlite3_open, calling it will still route through the codec
-            # setup path and fire our hook.
+            # Strategy 1: Find sqlite3_open by export name (any module).
+            # Strategy 2: Find by symbol table (Module.enumerateSymbols).
+            # Strategy 3: Use Windows API to bring WeChat window to foreground,
+            #             which triggers UI refresh → database reads.
             trigger_ok = False
             if self._auto_trigger and not done.is_set():
                 trigger_script = session.create_script(r"""
                     rpc.exports = {
                         findAndCallOpen: function (dbPath) {
                             var fn = null;
+                            var fnName = '';
+
+                            // Strategy 1: Module exports
                             Process.enumerateModules().forEach(function (m) {
                                 if (fn) return;
                                 ['sqlite3_open_v2', 'sqlite3_open'].forEach(function (name) {
@@ -292,15 +295,71 @@ class V4CodecExtractor(KeyExtractor):
                                     try { addr = Module.findExportByName(m.name, name); } catch (e) {}
                                     if (addr) {
                                         fn = new NativeFunction(addr, 'int', ['pointer', 'int']);
-                                        send({tag: 'diag', message: 'found ' + name + ' in ' + m.name});
+                                        fnName = m.name + '!' + name;
                                     }
                                 });
                             });
-                            if (!fn) return -2;
-                            var dbOut = Memory.alloc(Process.pointerSize);
-                            var pathPtr = Memory.allocUtf8String(dbPath);
-                            try { return fn(pathPtr, dbOut); }
-                            catch (e) { send({tag: 'error', message: 'trigger: ' + e.message}); return -1; }
+
+                            // Strategy 2: Symbol table search
+                            if (!fn) {
+                                Process.enumerateModules().forEach(function (m) {
+                                    if (fn) return;
+                                    try {
+                                        var syms = Module.enumerateSymbols(m.name);
+                                        for (var i = 0; i < syms.length; i++) {
+                                            if (syms[i].name === 'sqlite3_open' || syms[i].name === 'sqlite3_open_v2') {
+                                                fn = new NativeFunction(syms[i].address, 'int', ['pointer', 'int']);
+                                                fnName = m.name + '!' + syms[i].name;
+                                                break;
+                                            }
+                                        }
+                                    } catch (e) {}
+                                });
+                            }
+
+                            if (fn) {
+                                send({tag: 'diag', message: 'found sqlite3_open at ' + fnName});
+                                var dbOut = Memory.alloc(Process.pointerSize);
+                                var pathPtr = Memory.allocUtf8String(dbPath);
+                                try { return fn(pathPtr, dbOut); }
+                                catch (e) { send({tag: 'error', message: 'trigger: ' + e.message}); return -1; }
+                            }
+                            return -2;
+                        },
+
+                        // Strategy 3: Bring WeChat window to foreground to trigger DB reads
+                        bringWindowForward: function () {
+                            try {
+                                var user32 = Module.load('user32.dll');
+                                if (!user32) return -1;
+
+                                var findWindow = null;
+                                var setForeground = null;
+                                var enumWindows = null;
+
+                                try { findWindow = new NativeFunction(
+                                    Module.findExportByName('user32.dll', 'FindWindowW'), 'pointer', ['pointer', 'pointer']); } catch(e) {}
+                                try { setForeground = new NativeFunction(
+                                    Module.findExportByName('user32.dll', 'SetForegroundWindow'), 'int', ['pointer']); } catch(e) {}
+
+                                if (!findWindow || !setForeground) return -2;
+
+                                // Try known WeChat window class names
+                                var classNames = ['WeChatMainWndForPC', 'WeChat Login', 'WeChat'];
+                                for (var i = 0; i < classNames.length; i++) {
+                                    var clsPtr = Memory.allocUtf16String(classNames[i]);
+                                    var hwnd = findWindow(clsPtr, NULL);
+                                    if (!hwnd.isNull()) {
+                                        setForeground(hwnd);
+                                        send({tag: 'diag', message: 'brought window to foreground: ' + classNames[i]});
+                                        return 0;
+                                    }
+                                }
+                                return -3;
+                            } catch (e) {
+                                send({tag: 'error', message: 'bringWindowForward: ' + e.message});
+                                return -1;
+                            }
                         },
                     };
                 """)
@@ -311,32 +370,45 @@ class V4CodecExtractor(KeyExtractor):
                     logger.info(f"V4CodecExtractor: auto-trigger sqlite3_open rc={rc}")
                     trigger_ok = rc >= 0
                 except Exception as exc:
-                    logger.debug(f"V4CodecExtractor: auto-trigger not available ({exc})")
-                finally:
+                    logger.debug(f"V4CodecExtractor: auto-trigger sqlite3_open failed ({exc})")
+
+                if not trigger_ok:
+                    # Strategy 3: bring WeChat window to foreground
                     try:
-                        trigger_script.unload()
-                    except Exception:
-                        pass
+                        rc2 = trigger_script.exports_sync.bring_window_forward()
+                        if rc2 == 0:
+                            logger.info("V4CodecExtractor: brought WeChat window to foreground — waiting for DB activity")
+                    except Exception as exc:
+                        logger.debug(f"V4CodecExtractor: window trigger failed ({exc})")
+
+                try:
+                    trigger_script.unload()
+                except Exception:
+                    pass
+
                 if trigger_ok:
                     # Brief window for the codec hook to fire.
                     done.wait(timeout=5.0)
                 else:
-                    logger.info(
-                        "V4CodecExtractor: sqlite3_open not exported — "
-                        "please interact with WeChat (open a chat, scroll "
-                        "Moments) to trigger a database open..."
+                    logger.warning(
+                        "V4CodecExtractor: auto-trigger unavailable — "
+                        "please interact with WeChat NOW (open a chat, scroll messages, "
+                        "or restart WeChat) within the next 60 seconds..."
                     )
 
             # Final wait: either auto-trigger got the key, or fall back to
             # natural WeChat DB activity.
             if "key" not in key_holder:
-                remaining = self._timeout_s
                 if trigger_ok:
                     # Auto-trigger already waited ~5s; reduce accordingly.
                     remaining = max(5.0, self._timeout_s - 5.0)
                 else:
-                    # No auto-trigger; use full timeout for user interaction.
-                    remaining = max(15.0, self._timeout_s)
+                    # No auto-trigger; use extended timeout for user interaction.
+                    remaining = max(60.0, self._timeout_s * 2)
+                    logger.info(
+                        f"V4CodecExtractor: waiting up to {remaining:.0f}s for "
+                        "WeChat database activity..."
+                    )
                 done.wait(timeout=remaining)
         finally:
             try:
