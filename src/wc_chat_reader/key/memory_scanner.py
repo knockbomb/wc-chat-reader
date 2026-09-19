@@ -185,6 +185,53 @@ class WindowsMemoryScanner:
             else:
                 cur = next_addr
 
+    def iter_rw_all(
+        self,
+        min_size: int = 64 * 1024,
+    ) -> Iterator[MemoryRegion]:
+        """Yield ALL committed RW regions (any type, including MEM_MAPPED).
+
+        Unlike ``iter_regions()`` which filters to MEM_PRIVATE only (heap),
+        this includes MEM_MAPPED regions — DLL .data sections, shared memory,
+        etc.  Used by V4BroadScanExtractor to search the full writable
+        address space.
+        """
+        cur = 0x10000
+        max_addr = 0x7FFFFFFFFFFF
+        mbi = _MEMORY_BASIC_INFORMATION()
+        while cur < max_addr:
+            ret = self._kernel32.VirtualQueryEx(
+                self._handle,
+                ctypes.c_void_p(cur),
+                ctypes.byref(mbi),
+                ctypes.sizeof(mbi),
+            )
+            if ret == 0:
+                break
+            region = MemoryRegion(
+                base=mbi.BaseAddress or 0,
+                size=int(mbi.RegionSize),
+                protect=int(mbi.Protect),
+                state=int(mbi.State),
+                type_=int(mbi.Type),
+            )
+            # Only require: committed, readable, writable, min_size.
+            # No filter on type (MEM_PRIVATE vs MEM_MAPPED vs MEM_IMAGE).
+            is_rw = bool(
+                region.protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE)
+            )
+            if (
+                region.state == MEM_COMMIT
+                and region.size >= min_size
+                and is_rw
+            ):
+                yield region
+            next_addr = region.base + region.size
+            if next_addr <= cur:
+                cur += 0x1000
+            else:
+                cur = next_addr
+
     def read(self, addr: int, size: int) -> bytes | None:
         """Read ``size`` bytes at ``addr``. Returns None on failure."""
         buf = (ctypes.c_ubyte * size)()
