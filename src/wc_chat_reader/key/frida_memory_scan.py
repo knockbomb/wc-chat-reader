@@ -16,10 +16,15 @@ fundamentally faster because:
    near-memcpy speed.
 3. We can scan the full address space without a manual I/O budget.
 
-Additionally, WeChat 4.1.13.12 may have changed the codec descriptor
-layout, so the key pointer is no longer at a fixed offset before the
-pattern.  This extractor tries *multiple* candidate extraction offsets:
-before the pattern, after the pattern, and inline within the struct.
+Runtime key struct layout (verified on WeChat 4.1.15.13)::
+
+    [key_ptr (8B)] [flags=0 (8B)] [key_size=32 (8B)] [...]
+
+The relaxed pattern ``[0, 32]`` matches the runtime struct in **writable**
+heap memory.  The AES-256 key pointer is at ``ptr@-8`` from the pattern.
+
+The full pattern ``[0, 32, 47]`` is a compile-time constant in Weixin.dll's
+``.rdata`` section — diagnostic only, does NOT yield key candidates.
 
 Only runs on Windows against a V4 process when the optional ``frida``
 extra is installed.  Requires elevation (admin) for process injection.
@@ -27,7 +32,6 @@ extra is installed.  Requires elevation (admin) for process injection.
 
 from __future__ import annotations
 
-import struct
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,40 +51,34 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# The same 24-byte pattern used by V4MemoryExtractor.
-# Three little-endian 64-bit values: 0x00, 0x20 (32), 0x2F (47).
-_V4_PATTERN_HEX = "00 00 00 00 00 00 00 00 20 00 00 00 00 00 00 00 2f 00 00 00 00 00 00 00"
-
-# Relaxed pattern: just [0, 32] — 16 bytes
+# ── Patterns ──────────────────────────────────────────────────────────
+# PRIMARY: relaxed [0, 32] — matches runtime heap struct
 _V4_RELAXED_HEX = "00 00 00 00 00 00 00 00 20 00 00 00 00 00 00 00"
 
-# key_size marker: 32 as uint64 LE — 8 bytes
-_KEYSIZE_MARKER_HEX = "20 00 00 00 00 00 00 00"
+# DIAGNOSTIC: full [0, 32, 47] — matches .rdata constant (no key nearby)
+_V4_FULL_HEX = "00 00 00 00 00 00 00 00 20 00 00 00 00 00 00 00 2f 00 00 00 00 00 00 00"
 
-# Frida script: scans Weixin.dll module (ALL sections including .rdata)
-# for the pattern, then extracts candidate keys from multiple offsets.
-#
-# WHY scan the module instead of 'rw-' ranges:
-# The codec descriptor [0, 32, 47] is a compile-time constant stored in
-# .rdata (PAGE_READONLY), NOT in writable heap or .data sections.
-# Process.enumerateRanges('rw-') skips .rdata entirely — that's why the
-# old scan returned 0 matches.  Scanning by module covers all sections.
+# Frida script:
+# Phase 0 (PRIMARY): Relaxed pattern [0, 32] in RW heap ranges.
+#   The runtime key struct lives on the heap. ptr@-8 from the pattern
+#   points to the 32-byte AES key.
+# Phase 1 (DIAGNOSTIC): Full pattern [0, 32, 47] in Weixin.dll module.
+#   Found in .rdata — logs match count but expects 0 key candidates.
 _FRIDA_SCAN_SCRIPT = r"""
 (function () {
     'use strict';
-    var PATTERN = %(pattern_q)s;
     var RELAXED = %(relaxed_q)s;
-    var KEYMARKER = %(keymarker_q)s;
+    var FULL = %(full_q)s;
     var KEY_SIZE = 32;
     var MIN_PTR = 0x10000;
     var MAX_PTR = 0x7fffffffffffd;
     var sent = 0;
-    var matches = 0;
     var relaxedMatches = 0;
-    var markerMatches = 0;
+    var fullMatches = 0;
 
-    var PTR_OFFSETS = [-16, -8, 24, 32, 40, -24, -32, 48, 56, -40, -48];
-    var INLINE_OFFSETS = [-40, -32, -24, -16, 24, 32, 40, 48, 56, 64, -48, -56, 72, 80];
+    // ptr@-8 first — verified working on WeChat 4.1.15.13
+    var PTR_OFFSETS = [-8, -16, 24, 32, 40, -24, -32, 48, 56, -40, -48];
+    var INLINE_OFFSETS = [-40, -32, -24, -16, 24, 32, 40, 48, 56, 64];
 
     var DLL_NAME = %(module_q)s;
 
@@ -91,9 +89,7 @@ _FRIDA_SCAN_SCRIPT = r"""
     function tryReadKey(addr) {
         try {
             var key = addr.readByteArray(KEY_SIZE);
-            if (key && key.byteLength === KEY_SIZE) {
-                return key;
-            }
+            if (key && key.byteLength === KEY_SIZE) return key;
         } catch (e) {}
         return null;
     }
@@ -114,7 +110,6 @@ _FRIDA_SCAN_SCRIPT = r"""
             if (counts[i] > maxCount) maxCount = counts[i];
         }
         if (maxCount > 3) return false;
-        // Shannon entropy
         var entropy = 0;
         for (var i = 0; i < 256; i++) {
             if (counts[i] > 0) {
@@ -126,165 +121,78 @@ _FRIDA_SCAN_SCRIPT = r"""
         return true;
     }
 
-    function scanForPattern(base, size, pattern, label) {
-        var localMatches = 0;
+    function extractCandidates(address, label) {
+        PTR_OFFSETS.forEach(function (off) {
+            try {
+                var ptr = address.add(off).readPointer();
+                if (isValidPtr(ptr)) {
+                    var key = tryReadKey(ptr);
+                    if (key && isLikelyKey(key)) {
+                        sent++;
+                        send({tag: 'candidate', offset: off, mode: 'ptr',
+                              addr: address.toString(), label: label}, key);
+                    }
+                }
+            } catch (e) {}
+        });
+        INLINE_OFFSETS.forEach(function (off) {
+            try {
+                var key = tryReadKey(address.add(off));
+                if (key && isLikelyKey(key)) {
+                    sent++;
+                    send({tag: 'candidate', offset: off, mode: 'inline',
+                          addr: address.toString(), label: label}, key);
+                }
+            } catch (e) {}
+        });
+    }
+
+    send({tag: 'scan_start', message: 'scanning for V4 key (relaxed pattern primary)'});
+
+    // ═══ Phase 0 (PRIMARY): Relaxed pattern [0, 32] in RW heap ═══
+    var ranges = Process.enumerateRanges('rw-');
+    send({tag: 'diag', message: ranges.length + ' rw- range(s)'});
+    ranges.forEach(function (range) {
+        if (range.size < 64 * 1024) return;  // skip tiny regions
         try {
-            Memory.scan(base, size, pattern, {
+            Memory.scan(range.base, range.size, RELAXED, {
                 onMatch: function (address, sz) {
-                    localMatches++;
-                    // Pointer-based extraction
-                    PTR_OFFSETS.forEach(function (off) {
-                        try {
-                            var ptrAddr = address.add(off);
-                            var ptr = ptrAddr.readPointer();
-                            if (isValidPtr(ptr)) {
-                                var key = tryReadKey(ptr);
-                                if (key && isLikelyKey(key)) {
-                                    sent++;
-                                    send({
-                                        tag: 'candidate',
-                                        offset: off,
-                                        mode: 'ptr',
-                                        addr: address.toString(),
-                                        label: label,
-                                    }, key);
-                                }
-                            }
-                        } catch (e) {}
-                    });
-                    // Inline extraction
-                    INLINE_OFFSETS.forEach(function (off) {
-                        try {
-                            var key = tryReadKey(address.add(off));
-                            if (key && isLikelyKey(key)) {
-                                sent++;
-                                send({
-                                    tag: 'candidate',
-                                    offset: off,
-                                    mode: 'inline',
-                                    addr: address.toString(),
-                                    label: label,
-                                }, key);
-                            }
-                        } catch (e) {}
-                    });
+                    relaxedMatches++;
+                    extractCandidates(address, 'heap');
                 },
                 onComplete: function () {}
             });
-        } catch (e) {
-            send({tag: 'diag', message: label + ' scan error: ' + e.message});
-        }
-        return localMatches;
-    }
+        } catch (e) {}
+    });
+    send({tag: 'progress', phase: 'relaxed-rw', matches: relaxedMatches, candidates: sent});
 
-    send({tag: 'scan_start', message: 'scanning WeChat modules for V4 key'});
-
-    // === Strategy 1: Scan Weixin.dll module (ALL sections: .text, .rdata, .data) ===
+    // ═══ Phase 1 (DIAGNOSTIC): Full pattern in Weixin.dll module ═══
     var dllModule = Process.findModuleByName(DLL_NAME);
     if (dllModule) {
-        send({tag: 'diag', message: DLL_NAME + ' base=0x' + dllModule.base.toString(16) + ' size=0x' + dllModule.size.toString(16) + ' (' + (dllModule.size/1024/1024).toFixed(1) + ' MB)'});
-
-        // Phase 1: Full pattern [0, 32, 47]
-        matches = scanForPattern(dllModule.base, dllModule.size, PATTERN, 'full');
-        send({tag: 'progress', phase: 'full', matches: matches, candidates: sent});
-
-        // Phase 2: Relaxed pattern [0, 32]
-        if (sent < 200) {
-            relaxedMatches = scanForPattern(dllModule.base, dllModule.size, RELAXED, 'relaxed');
-            send({tag: 'progress', phase: 'relaxed', matches: relaxedMatches, candidates: sent});
-        }
-
-        // Phase 3: key_size marker (layout-agnostic)
-        if (sent < 200) {
-            markerMatches = scanForPattern(dllModule.base, dllModule.size, KEYMARKER, 'marker');
-            send({tag: 'progress', phase: 'marker', matches: markerMatches, candidates: sent});
-        }
-    } else {
-        send({tag: 'diag', message: DLL_NAME + ' not found, falling back to rw- scan'});
-    }
-
-    // === Strategy 2: Also scan RW heap ranges (in case key struct is on heap) ===
-    if (sent < 200) {
-        var ranges = Process.enumerateRanges('rw-');
-        send({tag: 'diag', message: 'scanning ' + ranges.length + ' rw- ranges (heap fallback)'});
-        var heapMatches = 0;
-        ranges.forEach(function (range) {
-            if (range.size < 24) return;
-            // Only scan large heap blocks to avoid excessive scanning
-            if (range.size < 64 * 1024) return;
-            try {
-                Memory.scan(range.base, range.size, PATTERN, {
-                    onMatch: function (address, sz) {
-                        heapMatches++;
-                        PTR_OFFSETS.forEach(function (off) {
-                            try {
-                                var ptr = address.add(off).readPointer();
-                                if (isValidPtr(ptr)) {
-                                    var key = tryReadKey(ptr);
-                                    if (key && isLikelyKey(key)) {
-                                        sent++;
-                                        send({tag: 'candidate', offset: off, mode: 'ptr', addr: address.toString(), label: 'heap'}, key);
-                                    }
-                                }
-                            } catch (e) {}
-                        });
-                        INLINE_OFFSETS.forEach(function (off) {
-                            try {
-                                var key = tryReadKey(address.add(off));
-                                if (key && isLikelyKey(key)) {
-                                    sent++;
-                                    send({tag: 'candidate', offset: off, mode: 'inline', addr: address.toString(), label: 'heap'}, key);
-                                }
-                            } catch (e) {}
-                        });
-                    },
-                    onComplete: function () {}
-                });
-            } catch (e) {}
-        });
-        send({tag: 'progress', phase: 'heap', matches: heapMatches, candidates: sent});
-    }
-
-    // === Strategy 3: Scan ALL modules' .data sections for key_size marker ===
-    if (sent < 200) {
-        var allModules = Process.enumerateModules();
-        var dataScanCount = 0;
-        allModules.forEach(function (mod) {
-            if (sent >= 500) return;
-            // Only scan modules with "wechat" or "weixin" in name, or the main exe
-            var nameLow = mod.name.toLowerCase();
-            if (nameLow.indexOf('wechat') === -1 && nameLow.indexOf('weixin') === -1 && nameLow.indexOf('wcdb') === -1) return;
-            dataScanCount++;
-            try {
-                var secs = Module.enumerateSections(mod.name);
-                if (!secs) return;
-                secs.forEach(function (sec) {
-                    if (sent >= 500) return;
-                    // .data section is typically writable
-                    if (sec.name && (sec.name === '.data' || sec.name === '.Data')) {
-                        scanForPattern(sec.base, sec.size, KEYMARKER, mod.name + '!' + sec.name);
-                    }
-                });
-            } catch (e) {}
-        });
-        if (dataScanCount > 0) {
-            send({tag: 'diag', message: 'scanned .data of ' + dataScanCount + ' wechat-related module(s), total candidates: ' + sent});
-        }
+        send({tag: 'diag', message: DLL_NAME + ' base=0x' + dllModule.base.toString(16) +
+              ' size=' + (dllModule.size/1024/1024).toFixed(1) + ' MB'});
+        try {
+            Memory.scan(dllModule.base, dllModule.size, FULL, {
+                onMatch: function (address, sz) {
+                    fullMatches++;
+                },
+                onComplete: function () {}
+            });
+        } catch (e) {}
+        send({tag: 'progress', phase: 'full-module (diag)', matches: fullMatches, candidates: sent});
     }
 
     send({
         tag: 'scan_done',
-        matches: matches,
         relaxed: relaxedMatches,
-        marker: markerMatches,
+        full: fullMatches,
         candidates: sent,
         module: dllModule ? DLL_NAME : 'not found',
     });
 })();
 """ % {
-    "pattern_q": '"%s"' % _V4_PATTERN_HEX,
     "relaxed_q": '"%s"' % _V4_RELAXED_HEX,
-    "keymarker_q": '"%s"' % _KEYSIZE_MARKER_HEX,
+    "full_q": '"%s"' % _V4_FULL_HEX,
     "module_q": '"Weixin.dll"',
 }
 
@@ -308,12 +216,15 @@ class FridaMemoryScanExtractor(KeyExtractor):
 
     Uses Frida's native ``Memory.scan()`` to search the target process's
     memory from within — dramatically faster than cross-process
-    ``ReadProcessMemory`` calls.  Tries multiple struct-layout offsets to
-    handle WeChat versions that changed the codec descriptor layout.
+    ``ReadProcessMemory`` calls.
+
+    Primary strategy: relaxed pattern ``[0, 32]`` in RW heap ranges with
+    ``ptr@-8`` key extraction.  Full pattern ``[0, 32, 47]`` in Weixin.dll
+    module is logged as diagnostic only.
     """
 
     name = "frida-memory-scan"
-    priority = 5  # Run BEFORE the original v4-memory-scan (10) and codec hook (20).
+    priority = 5  # Run BEFORE v4-memory-scan (10) and codec hook (20).
 
     def __init__(self, timeout_s: float = 300.0) -> None:
         self._timeout_s = timeout_s
@@ -416,20 +327,19 @@ class FridaMemoryScanExtractor(KeyExtractor):
                 f"FridaMemoryScan: {fatal_msg['msg']}"
             )
 
-        full_m = progress_info.get("matches", 0)
         relaxed_m = progress_info.get("relaxed", 0)
-        marker_m = progress_info.get("marker", 0)
+        full_m = progress_info.get("full", 0)
         logger.info(
             f"FridaMemoryScan: scan complete — "
-            f"full={full_m}, relaxed={relaxed_m}, marker={marker_m}, "
+            f"relaxed={relaxed_m}, full(diag)={full_m}, "
             f"{len(candidates)} candidate(s) extracted"
         )
 
         if not candidates:
             raise NoValidKeyError(
-                f"FridaMemoryScan: pattern matched {total_matches} time(s) but "
-                "no usable key candidates could be extracted. The codec descriptor "
-                "layout may have changed in this WeChat version."
+                f"FridaMemoryScan: relaxed pattern matched {relaxed_m} time(s) "
+                f"but no usable key candidates extracted. The runtime struct "
+                f"layout may have changed in WeChat {process.version_str}."
             )
 
         # Validate candidates.  Log progress every 100 validations.

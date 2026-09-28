@@ -1,18 +1,22 @@
 """V4 broad-scan key extractor for WeChat 4.1.13+.
 
-Searches ALL readable memory (including DLL .rdata read-only data sections)
-using ReadProcessMemory, with multiple pattern layouts and extraction offsets.
+Runtime key struct layout (verified on WeChat 4.1.15.13)::
 
-Key insight: the codec descriptor ``[0, 32, 47]`` is a compile-time constant
-stored in Weixin.dll's ``.rdata`` section (PAGE_READONLY), NOT in writable
-heap or .data sections.  Previous versions only scanned RW regions and
-missed it entirely.
+    [key_ptr (8B)] [flags=0 (8B)] [key_size=32 (8B)] [...]
+
+The relaxed pattern ``[0, 32]`` (16 bytes) matches the runtime struct in
+**writable** heap memory.  The actual AES-256 key is an 8-byte pointer
+*before* the pattern start (``ptr@-8``).
+
+The full pattern ``[0, 32, 47]`` (24 bytes) is a *compile-time constant*
+in Weixin.dll's ``.rdata`` section (PAGE_READONLY).  It describes default
+codec parameters but does NOT contain the key pointer — scanning it is
+diagnostic only.
 
 Phases:
-  0. Full pattern in ALL readable regions (.rdata, .data, heap)
-  1. Full pattern in RW regions only
-  2. Relaxed pattern ``[0, 32]`` in RW regions
-  3. key_size marker ``20 00…`` in RW regions
+  0. **Relaxed pattern** ``[0, 32]`` in RW regions → PRIMARY extraction
+  1. Full pattern ``[0, 32, 47]`` in RW regions (diagnostic, usually 0 candidates)
+  2. Full pattern in ALL readable regions incl. .rdata (diagnostic log only)
 
 Uses entropy pre-filtering to keep PBKDF2 tractable.
 
@@ -50,7 +54,24 @@ logger = get_logger(__name__)
 MIN_PTR = 0x10000
 MAX_PTR = 0x7FFFFFFFFFFF
 
-# Pattern A: full original [0, 32, 47] — 24 bytes
+# ── Patterns ──────────────────────────────────────────────────────────
+#
+# Runtime struct (heap, RW): [key_ptr][0][32][...]
+#   → Relaxed pattern [0, 32] matches at offset +8 from struct start.
+#   → Key pointer is at offset -8 from pattern start.
+#
+# Compile-time constant (.rdata, RO): [0][32][47]
+#   → Full pattern matches but yields NO key candidates (no pointer nearby).
+
+# PRIMARY: relaxed [0, 32] — 16 bytes, matches runtime heap struct
+_PATTERN_RELAXED = bytes(
+    [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]
+)
+
+# DIAGNOSTIC: full [0, 32, 47] — 24 bytes, matches .rdata constant
 _PATTERN_FULL = bytes(
     [
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -59,19 +80,8 @@ _PATTERN_FULL = bytes(
     ]
 )
 
-# Pattern B: relaxed [0, 32] — 16 bytes
-_PATTERN_RELAXED = bytes(
-    [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ]
-)
-
-# Pattern C: key_size marker — 8 bytes (most layout-agnostic)
-_KEYSIZE_MARKER = b"\x20\x00\x00\x00\x00\x00\x00\x00"
-
-# Pointer offsets from pattern start
-PTR_OFFSETS = [-16, -8, 24, 32, 40]
+# Pointer offsets from pattern start — ptr@-8 first (verified working)
+PTR_OFFSETS = [-8, -16, 24, 32, 40]
 
 # Inline offsets from pattern start
 INLINE_OFFSETS = [-40, -32, -24, -16, 24, 32, 40, 48, 56, 64]
@@ -137,8 +147,21 @@ def _scan_pattern(
     return matches
 
 
+def _count_pattern(
+    scanner: WindowsMemoryScanner,
+    regions: list[MemoryRegion],
+    pattern: bytes,
+) -> int:
+    """Count pattern matches without extracting candidates (diagnostic)."""
+    total = 0
+    for region in regions:
+        for chunk, _ in _read_chunks(scanner, region):
+            total += sum(1 for _ in _find_all(chunk, pattern))
+    return total
+
+
 class V4BroadScanExtractor(KeyExtractor):
-    """Broad memory scan: multi-pattern, multi-offset, all readable regions."""
+    """Broad memory scan: relaxed pattern primary, full pattern diagnostic."""
 
     name = "v4-broad-scan"
     priority = 4
@@ -179,29 +202,7 @@ class V4BroadScanExtractor(KeyExtractor):
 
         scanner = WindowsMemoryScanner(process.pid)
         try:
-            # Phase 0: Full pattern in ALL readable regions (includes .rdata)
-            # The codec descriptor is a compile-time constant in .rdata.
-            all_regions: list[MemoryRegion] = []
-            all_size = 0
-            for r in scanner.iter_readable_all(min_size=4 * 1024):
-                all_regions.append(r)
-                all_size += r.size
-
-            logger.info(
-                f"v4-broad-scan: {len(all_regions)} readable region(s), "
-                f"{all_size / 1024 / 1024:.0f} MB total"
-            )
-
-            p0 = _scan_pattern(
-                scanner, all_regions, _PATTERN_FULL,
-                self._max_candidates, candidates,
-            )
-            logger.info(
-                f"v4-broad-scan: [phase 0: full pattern, all readable] "
-                f"{p0} match(es), {len(candidates)} candidate(s)"
-            )
-
-            # Phase 1-3: RW regions only (for relaxed/marker patterns)
+            # Collect RW regions (primary scan target)
             rw_regions: list[MemoryRegion] = []
             rw_size = 0
             for r in scanner.iter_rw_all(min_size=64 * 1024):
@@ -213,44 +214,51 @@ class V4BroadScanExtractor(KeyExtractor):
                 f"{rw_size / 1024 / 1024:.0f} MB"
             )
 
-            # Phase 1: Full pattern in RW only
+            # Phase 0: Relaxed pattern [0, 32] in RW → PRIMARY
+            p0 = _scan_pattern(
+                scanner, rw_regions, _PATTERN_RELAXED,
+                self._max_candidates, candidates,
+            )
+            logger.info(
+                f"v4-broad-scan: [phase 0: relaxed pattern, RW] "
+                f"{p0} match(es), {len(candidates)} candidate(s)"
+            )
+
+            # Phase 1: Full pattern [0, 32, 47] in RW → diagnostic
             if len(candidates) < 200:
                 p1 = _scan_pattern(
                     scanner, rw_regions, _PATTERN_FULL,
                     self._max_candidates, candidates,
                 )
                 logger.info(
-                    f"v4-broad-scan: [phase 1: full pattern, RW] "
+                    f"v4-broad-scan: [phase 1: full pattern, RW (diagnostic)] "
                     f"{p1} match(es), {len(candidates)} candidate(s)"
                 )
 
-            # Phase 2: Relaxed pattern [0, 32]
+            # Phase 2: Full pattern in ALL readable → diagnostic log only
             if len(candidates) < 200:
-                p2 = _scan_pattern(
-                    scanner, rw_regions, _PATTERN_RELAXED,
-                    self._max_candidates, candidates,
-                )
-                logger.info(
-                    f"v4-broad-scan: [phase 2: relaxed pattern] "
-                    f"{p2} match(es), {len(candidates)} candidate(s)"
-                )
+                all_regions: list[MemoryRegion] = []
+                all_size = 0
+                for r in scanner.iter_readable_all(min_size=4 * 1024):
+                    all_regions.append(r)
+                    all_size += r.size
 
-            # Phase 3: key_size marker
-            if len(candidates) < 200:
-                p3 = _scan_pattern(
-                    scanner, rw_regions, _KEYSIZE_MARKER,
-                    self._max_candidates, candidates,
-                )
+                ro_only = [
+                    r for r in all_regions
+                    if r not in rw_regions
+                ]
+                p2 = _count_pattern(scanner, ro_only, _PATTERN_FULL)
                 logger.info(
-                    f"v4-broad-scan: [phase 3: key_size marker] "
-                    f"{p3} match(es), {len(candidates)} candidate(s)"
+                    f"v4-broad-scan: [phase 2: full pattern, RO-only "
+                    f"(diagnostic)] {p2} match(es) in "
+                    f"{len(ro_only)} read-only region(s)"
                 )
         finally:
             scanner.close()
 
         if not candidates:
             raise NoValidKeyError(
-                "v4-broad-scan: no candidates found in any memory region."
+                "v4-broad-scan: no candidates found in any RW memory region."
             )
 
         # Deduplicate

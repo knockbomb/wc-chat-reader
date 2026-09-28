@@ -1,8 +1,15 @@
 """WeChat 4.0 key extractor (Windows).
 
-WeChat 4.0 changed memory layout — the AES key pointer is now identifiable
-by a 24-byte pattern (three 8-byte little-endian values). This matches the
-constant pattern used by chatlog v4 extractor.
+Runtime key struct layout (verified on WeChat 4.1.15.13)::
+
+    [key_ptr (8B)] [flags=0 (8B)] [key_size=32 (8B)] [...]
+
+The relaxed 16-byte pattern ``[0, 32]`` matches the runtime struct in
+writable heap memory.  The AES-256 key pointer is 8 bytes before the
+pattern start (``ptr@-8``, handled by ``_BaseMemoryExtractor``).
+
+The full 24-byte pattern ``[0, 32, 47]`` is a compile-time constant in
+Weixin.dll's .rdata — it does NOT appear in the runtime heap struct.
 """
 
 from __future__ import annotations
@@ -20,13 +27,12 @@ class V4MemoryExtractor(_BaseMemoryExtractor):
 
     _params = _ExtractParams(
         version=WeChatVersion.V4,
-        # v4 pattern (from chatlog): three little-endian 64-bit values —
-        # 0x00, 0x20 (key size = 32), 0x2F.
+        # Relaxed pattern: [0, 32] — matches runtime heap struct.
+        # Key pointer is at idx - ptr_size (= -8 bytes before pattern).
         pattern=bytes(
             [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x2F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             ]
         ),
         ptr_size=8,
