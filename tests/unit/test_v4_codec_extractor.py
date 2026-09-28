@@ -49,8 +49,9 @@ class TestChooseSignature:
 
 @pytest.mark.unit
 class TestV4CodecExtractorGating:
-    def test_supports_matching_version(self):
+    def test_supports_matching_version(self, monkeypatch):
         ex = V4CodecExtractor()
+        monkeypatch.setattr(ex, "_frida_available", staticmethod(lambda: True))
         assert ex.supports(_fake_process("4.1.13.12")) is True
 
     def test_unsupported_reason_low_version(self):

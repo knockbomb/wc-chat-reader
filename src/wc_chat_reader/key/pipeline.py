@@ -21,12 +21,9 @@ from wc_chat_reader.core.exceptions import (
     NoValidKeyError,
 )
 from wc_chat_reader.core.logger import get_logger
-from wc_chat_reader.key.frida_direct import FridaDirectExtractor
-from wc_chat_reader.key.frida_extractor import FridaExtractor
-from wc_chat_reader.key.frida_memory_scan import FridaMemoryScanExtractor
+from wc_chat_reader.key.frida_hybrid import FridaHybridExtractor
 from wc_chat_reader.key.v3_extractor import V3MemoryExtractor
 from wc_chat_reader.key.v4_broad_scan import V4BroadScanExtractor
-from wc_chat_reader.key.v4_codec_extractor import V4CodecExtractor
 from wc_chat_reader.key.v4_extractor import V4MemoryExtractor
 
 if TYPE_CHECKING:
@@ -80,12 +77,9 @@ class ExtractionPipeline:
             extractors=sorted(
                 [
                     V3MemoryExtractor(),
-                    FridaDirectExtractor(),
+                    FridaHybridExtractor(),
                     V4BroadScanExtractor(),
                     V4MemoryExtractor(),
-                    FridaMemoryScanExtractor(),
-                    V4CodecExtractor(auto_trigger=True),
-                    FridaExtractor(auto_trigger=True),
                 ],
                 key=lambda e: e.priority,
             )
