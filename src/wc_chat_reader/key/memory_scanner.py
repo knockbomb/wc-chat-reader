@@ -232,6 +232,47 @@ class WindowsMemoryScanner:
             else:
                 cur = next_addr
 
+    def iter_readable_all(
+        self,
+        min_size: int = 4 * 1024,
+    ) -> Iterator[MemoryRegion]:
+        """Yield ALL committed readable regions (RW + RO, any type).
+
+        Includes .rdata sections (PAGE_READONLY) which contain compile-time
+        constants like the SQLCipher codec descriptor.  Used by
+        V4BroadScanExtractor for pattern search in read-only DLL data.
+        """
+        cur = 0x10000
+        max_addr = 0x7FFFFFFFFFFF
+        mbi = _MEMORY_BASIC_INFORMATION()
+        while cur < max_addr:
+            ret = self._kernel32.VirtualQueryEx(
+                self._handle,
+                ctypes.c_void_p(cur),
+                ctypes.byref(mbi),
+                ctypes.sizeof(mbi),
+            )
+            if ret == 0:
+                break
+            region = MemoryRegion(
+                base=mbi.BaseAddress or 0,
+                size=int(mbi.RegionSize),
+                protect=int(mbi.Protect),
+                state=int(mbi.State),
+                type_=int(mbi.Type),
+            )
+            if (
+                region.state == MEM_COMMIT
+                and region.size >= min_size
+                and region.is_readable
+            ):
+                yield region
+            next_addr = region.base + region.size
+            if next_addr <= cur:
+                cur += 0x1000
+            else:
+                cur = next_addr
+
     def read(self, addr: int, size: int) -> bytes | None:
         """Read ``size`` bytes at ``addr``. Returns None on failure."""
         buf = (ctypes.c_ubyte * size)()

@@ -51,36 +51,38 @@ logger = get_logger(__name__)
 # Three little-endian 64-bit values: 0x00, 0x20 (32), 0x2F (47).
 _V4_PATTERN_HEX = "00 00 00 00 00 00 00 00 20 00 00 00 00 00 00 00 2f 00 00 00 00 00 00 00"
 
-# Frida script: scans all RW regions for the pattern, then extracts
-# candidate keys from multiple offsets around each match.
+# Relaxed pattern: just [0, 32] — 16 bytes
+_V4_RELAXED_HEX = "00 00 00 00 00 00 00 00 20 00 00 00 00 00 00 00"
+
+# key_size marker: 32 as uint64 LE — 8 bytes
+_KEYSIZE_MARKER_HEX = "20 00 00 00 00 00 00 00"
+
+# Frida script: scans Weixin.dll module (ALL sections including .rdata)
+# for the pattern, then extracts candidate keys from multiple offsets.
 #
-# Offsets tried (relative to pattern start):
-#   -8        : original layout — pointer immediately before pattern
-#   +24       : pointer immediately after pattern (layout shifted)
-#   +8        : pointer within the pattern (alternative layout)
-#   +32       : pointer 8 bytes after pattern end
-#   -16       : pointer 8 bytes before the assumed position
-#
-# For each candidate pointer that looks valid (canonical address range),
-# we read 32 bytes and send them back as a 'candidate' message.
+# WHY scan the module instead of 'rw-' ranges:
+# The codec descriptor [0, 32, 47] is a compile-time constant stored in
+# .rdata (PAGE_READONLY), NOT in writable heap or .data sections.
+# Process.enumerateRanges('rw-') skips .rdata entirely — that's why the
+# old scan returned 0 matches.  Scanning by module covers all sections.
 _FRIDA_SCAN_SCRIPT = r"""
 (function () {
     'use strict';
     var PATTERN = %(pattern_q)s;
+    var RELAXED = %(relaxed_q)s;
+    var KEYMARKER = %(keymarker_q)s;
     var KEY_SIZE = 32;
     var MIN_PTR = 0x10000;
     var MAX_PTR = 0x7fffffffffffd;
     var sent = 0;
     var matches = 0;
+    var relaxedMatches = 0;
+    var markerMatches = 0;
 
-    // Offsets (in bytes) from pattern start to try reading a key pointer.
-    // Each offset is where we read an 8-byte LE pointer, then dereference
-    // it to get the 32-byte candidate key.
-    var PTR_OFFSETS = [-16, -8, 24, 32, 40, -24, -32];
+    var PTR_OFFSETS = [-16, -8, 24, 32, 40, -24, -32, 48, 56, -40, -48];
+    var INLINE_OFFSETS = [-40, -32, -24, -16, 24, 32, 40, 48, 56, 64, -48, -56, 72, 80];
 
-    // Also try reading the key INLINE at fixed offsets from pattern start
-    // (no pointer dereference — the key might be embedded in the struct).
-    var INLINE_OFFSETS = [24, 32, -32, -24, 40, 48];
+    var DLL_NAME = %(module_q)s;
 
     function isValidPtr(p) {
         return p >= MIN_PTR && p <= MAX_PTR;
@@ -97,41 +99,40 @@ _FRIDA_SCAN_SCRIPT = r"""
     }
 
     function isLikelyKey(data) {
-        // Quick heuristic: a valid key should not be all zeros, all 0xFF,
-        // or have very low entropy (e.g., repeating pattern).
         if (!data) return false;
         var bytes = new Uint8Array(data);
-        var nonzero = 0, high = 0;
+        var counts = new Array(256);
+        for (var i = 0; i < 256; i++) counts[i] = 0;
+        var nonzero = 0;
         for (var i = 0; i < bytes.length; i++) {
+            counts[bytes[i]]++;
             if (bytes[i] !== 0) nonzero++;
-            if (bytes[i] > 0x80) high++;
         }
-        // Reject all-zeros, all-0xFF, or extremely skewed distributions.
-        if (nonzero === 0 || nonzero === 32) return false;
-        if (high === 0 || high === 32) return false;
+        if (nonzero < 20) return false;
+        var maxCount = 0;
+        for (var i = 0; i < 256; i++) {
+            if (counts[i] > maxCount) maxCount = counts[i];
+        }
+        if (maxCount > 3) return false;
+        // Shannon entropy
+        var entropy = 0;
+        for (var i = 0; i < 256; i++) {
+            if (counts[i] > 0) {
+                var p = counts[i] / bytes.length;
+                entropy -= p * (Math.log(p) / Math.log(2));
+            }
+        }
+        if (entropy < 5.0) return false;
         return true;
     }
 
-    send({tag: 'scan_start', message: 'scanning RW memory for V4 key pattern'});
-
-    // Enumerate memory ranges — only RW (heap) regions.
-    var ranges = Process.enumerateRanges('rw-');
-    var totalRanges = ranges.length;
-    var scannedRanges = 0;
-
-    send({tag: 'progress', ranges: totalRanges});
-
-    ranges.forEach(function (range) {
-        scannedRanges++;
-        if (range.size < 24) return;  // too small for pattern
-
+    function scanForPattern(base, size, pattern, label) {
+        var localMatches = 0;
         try {
-            Memory.scan(range.base, range.size, PATTERN, {
-                onMatch: function (address, size) {
-                    matches++;
-
-                    // Strategy 1: pointer-based — read 8 bytes at offset,
-                    // dereference as pointer to 32-byte key.
+            Memory.scan(base, size, pattern, {
+                onMatch: function (address, sz) {
+                    localMatches++;
+                    // Pointer-based extraction
                     PTR_OFFSETS.forEach(function (off) {
                         try {
                             var ptrAddr = address.add(off);
@@ -145,13 +146,13 @@ _FRIDA_SCAN_SCRIPT = r"""
                                         offset: off,
                                         mode: 'ptr',
                                         addr: address.toString(),
+                                        label: label,
                                     }, key);
                                 }
                             }
                         } catch (e) {}
                     });
-
-                    // Strategy 2: inline — read 32 bytes directly at offset.
+                    // Inline extraction
                     INLINE_OFFSETS.forEach(function (off) {
                         try {
                             var key = tryReadKey(address.add(off));
@@ -162,36 +163,130 @@ _FRIDA_SCAN_SCRIPT = r"""
                                     offset: off,
                                     mode: 'inline',
                                     addr: address.toString(),
+                                    label: label,
                                 }, key);
                             }
                         } catch (e) {}
                     });
                 },
-                onComplete: function () {
-                    if (scannedRanges %% 100 === 0 || scannedRanges === totalRanges) {
-                        send({
-                            tag: 'progress',
-                            scanned: scannedRanges,
-                            total: totalRanges,
-                            matches: matches,
-                            sent: sent,
-                        });
-                    }
-                }
+                onComplete: function () {}
             });
         } catch (e) {
-            // Range may have been unmapped between enumerate and scan.
+            send({tag: 'diag', message: label + ' scan error: ' + e.message});
         }
-    });
+        return localMatches;
+    }
+
+    send({tag: 'scan_start', message: 'scanning WeChat modules for V4 key'});
+
+    // === Strategy 1: Scan Weixin.dll module (ALL sections: .text, .rdata, .data) ===
+    var dllModule = Process.findModuleByName(DLL_NAME);
+    if (dllModule) {
+        send({tag: 'diag', message: DLL_NAME + ' base=0x' + dllModule.base.toString(16) + ' size=0x' + dllModule.size.toString(16) + ' (' + (dllModule.size/1024/1024).toFixed(1) + ' MB)'});
+
+        // Phase 1: Full pattern [0, 32, 47]
+        matches = scanForPattern(dllModule.base, dllModule.size, PATTERN, 'full');
+        send({tag: 'progress', phase: 'full', matches: matches, candidates: sent});
+
+        // Phase 2: Relaxed pattern [0, 32]
+        if (sent < 200) {
+            relaxedMatches = scanForPattern(dllModule.base, dllModule.size, RELAXED, 'relaxed');
+            send({tag: 'progress', phase: 'relaxed', matches: relaxedMatches, candidates: sent});
+        }
+
+        // Phase 3: key_size marker (layout-agnostic)
+        if (sent < 200) {
+            markerMatches = scanForPattern(dllModule.base, dllModule.size, KEYMARKER, 'marker');
+            send({tag: 'progress', phase: 'marker', matches: markerMatches, candidates: sent});
+        }
+    } else {
+        send({tag: 'diag', message: DLL_NAME + ' not found, falling back to rw- scan'});
+    }
+
+    // === Strategy 2: Also scan RW heap ranges (in case key struct is on heap) ===
+    if (sent < 200) {
+        var ranges = Process.enumerateRanges('rw-');
+        send({tag: 'diag', message: 'scanning ' + ranges.length + ' rw- ranges (heap fallback)'});
+        var heapMatches = 0;
+        ranges.forEach(function (range) {
+            if (range.size < 24) return;
+            // Only scan large heap blocks to avoid excessive scanning
+            if (range.size < 64 * 1024) return;
+            try {
+                Memory.scan(range.base, range.size, PATTERN, {
+                    onMatch: function (address, sz) {
+                        heapMatches++;
+                        PTR_OFFSETS.forEach(function (off) {
+                            try {
+                                var ptr = address.add(off).readPointer();
+                                if (isValidPtr(ptr)) {
+                                    var key = tryReadKey(ptr);
+                                    if (key && isLikelyKey(key)) {
+                                        sent++;
+                                        send({tag: 'candidate', offset: off, mode: 'ptr', addr: address.toString(), label: 'heap'}, key);
+                                    }
+                                }
+                            } catch (e) {}
+                        });
+                        INLINE_OFFSETS.forEach(function (off) {
+                            try {
+                                var key = tryReadKey(address.add(off));
+                                if (key && isLikelyKey(key)) {
+                                    sent++;
+                                    send({tag: 'candidate', offset: off, mode: 'inline', addr: address.toString(), label: 'heap'}, key);
+                                }
+                            } catch (e) {}
+                        });
+                    },
+                    onComplete: function () {}
+                });
+            } catch (e) {}
+        });
+        send({tag: 'progress', phase: 'heap', matches: heapMatches, candidates: sent});
+    }
+
+    // === Strategy 3: Scan ALL modules' .data sections for key_size marker ===
+    if (sent < 200) {
+        var allModules = Process.enumerateModules();
+        var dataScanCount = 0;
+        allModules.forEach(function (mod) {
+            if (sent >= 500) return;
+            // Only scan modules with "wechat" or "weixin" in name, or the main exe
+            var nameLow = mod.name.toLowerCase();
+            if (nameLow.indexOf('wechat') === -1 && nameLow.indexOf('weixin') === -1 && nameLow.indexOf('wcdb') === -1) return;
+            dataScanCount++;
+            try {
+                var secs = Module.enumerateSections(mod.name);
+                if (!secs) return;
+                secs.forEach(function (sec) {
+                    if (sent >= 500) return;
+                    // .data section is typically writable
+                    if (sec.name && (sec.name === '.data' || sec.name === '.Data')) {
+                        scanForPattern(sec.base, sec.size, KEYMARKER, mod.name + '!' + sec.name);
+                    }
+                });
+            } catch (e) {}
+        });
+        if (dataScanCount > 0) {
+            send({tag: 'diag', message: 'scanned .data of ' + dataScanCount + ' wechat-related module(s), total candidates: ' + sent});
+        }
+    }
 
     send({
         tag: 'scan_done',
         matches: matches,
+        relaxed: relaxedMatches,
+        marker: markerMatches,
         candidates: sent,
-        ranges: totalRanges,
+        module: dllModule ? DLL_NAME : 'not found',
     });
 })();
-""" % {"pattern_q": '"%s"' % _V4_PATTERN_HEX}
+""" % {
+    "pattern_q": '"%s"' % _V4_PATTERN_HEX,
+    "relaxed_q": '"%s"' % _V4_RELAXED_HEX,
+    "keymarker_q": '"%s"' % _KEYSIZE_MARKER_HEX,
+    "module_q": '"Weixin.dll"',
+}
 
 
 def _event() -> threading.Event:
@@ -282,16 +377,14 @@ class FridaMemoryScanExtractor(KeyExtractor):
                 progress_info.update(payload)
                 scan_done.set()
             elif tag == "progress":
-                scanned = payload.get("scanned", 0)
-                total = payload.get("ranges", payload.get("total", 0))
-                matches = payload.get("matches", 0)
-                sent = payload.get("sent", 0)
-                if total > 0:
-                    pct = scanned * 100 // total
-                    logger.debug(
-                        f"FridaMemoryScan: {pct}% ({scanned}/{total} ranges), "
-                        f"{matches} pattern matches, {sent} candidates"
-                    )
+                phase = payload.get("phase", "?")
+                m = payload.get("matches", 0)
+                c = payload.get("candidates", 0)
+                logger.info(
+                    f"FridaMemoryScan: [{phase}] {m} match(es), {c} candidate(s)"
+                )
+            elif tag == "diag":
+                logger.info(f"FridaMemoryScan: {payload.get('message', '')}")
             elif tag == "scan_start":
                 logger.info(f"FridaMemoryScan: {payload.get('message', '')}")
             elif tag == "fatal":
@@ -323,9 +416,12 @@ class FridaMemoryScanExtractor(KeyExtractor):
                 f"FridaMemoryScan: {fatal_msg['msg']}"
             )
 
-        total_matches = progress_info.get("matches", len(candidates))
+        full_m = progress_info.get("matches", 0)
+        relaxed_m = progress_info.get("relaxed", 0)
+        marker_m = progress_info.get("marker", 0)
         logger.info(
-            f"FridaMemoryScan: scan complete — {total_matches} pattern match(es), "
+            f"FridaMemoryScan: scan complete — "
+            f"full={full_m}, relaxed={relaxed_m}, marker={marker_m}, "
             f"{len(candidates)} candidate(s) extracted"
         )
 

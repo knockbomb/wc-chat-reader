@@ -179,7 +179,7 @@ class V4CodecExtractor(KeyExtractor):
 
     def __init__(
         self,
-        timeout_s: float = 30.0,
+        timeout_s: float = 120.0,
         auto_trigger: bool = True,
     ) -> None:
         self._timeout_s = timeout_s
@@ -391,9 +391,13 @@ class V4CodecExtractor(KeyExtractor):
                     done.wait(timeout=5.0)
                 else:
                     logger.warning(
-                        "V4CodecExtractor: auto-trigger unavailable — "
-                        "please interact with WeChat NOW (open a chat, scroll messages, "
-                        "or restart WeChat) within the next 60 seconds..."
+                        "=" * 60 + "\n"
+                        "  V4CodecExtractor: 自动触发失败\n"
+                        "  ⚠️  请在接下来 120 秒内执行以下操作：\n"
+                        "  1. 完全关闭微信（右键托盘图标 → 退出微信）\n"
+                        "  2. 重新打开微信并登录\n"
+                        "  本工具正在监听数据库打开事件，重启后会自动捕获密钥\n"
+                        "=" * 60
                     )
 
             # Final wait: either auto-trigger got the key, or fall back to
@@ -404,10 +408,10 @@ class V4CodecExtractor(KeyExtractor):
                     remaining = max(5.0, self._timeout_s - 5.0)
                 else:
                     # No auto-trigger; use extended timeout for user interaction.
-                    remaining = max(60.0, self._timeout_s * 2)
+                    remaining = self._timeout_s
                     logger.info(
                         f"V4CodecExtractor: waiting up to {remaining:.0f}s for "
-                        "WeChat database activity..."
+                        "WeChat restart + database activity..."
                     )
                 done.wait(timeout=remaining)
         finally:
@@ -418,9 +422,9 @@ class V4CodecExtractor(KeyExtractor):
 
         if "key" not in key_holder:
             raise NoValidKeyError(
-                "V4CodecExtractor: hooks were live but no valid key captured "
-                f"within {self._timeout_s}s. Interact with WeChat (open a chat "
-                "or restart it) to force a database open, then retry."
+                f"V4CodecExtractor: hooks were live but no valid key captured "
+                f"within {self._timeout_s:.0f}s. "
+                "请确保在工具运行期间重启了微信（完全退出后重新打开）。"
             )
         return KeyResult(
             key=key_holder["key"],

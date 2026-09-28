@@ -1,13 +1,20 @@
 """V4 broad-scan key extractor for WeChat 4.1.13+.
 
-Searches ALL writable memory (including DLL MEM_MAPPED data sections)
-using ReadProcessMemory, with multiple pattern layouts and extraction
-offsets.  Uses entropy pre-filtering to keep PBKDF2 tractable.
+Searches ALL readable memory (including DLL .rdata read-only data sections)
+using ReadProcessMemory, with multiple pattern layouts and extraction offsets.
 
-Also scans for the key_size marker ``20 00 00 00 00 00 00 00`` (32 as
-uint64 LE) as a layout-agnostic fallback — the codec descriptor always
-contains the key size, so this marker is present regardless of how the
-surrounding struct changed across WeChat versions.
+Key insight: the codec descriptor ``[0, 32, 47]`` is a compile-time constant
+stored in Weixin.dll's ``.rdata`` section (PAGE_READONLY), NOT in writable
+heap or .data sections.  Previous versions only scanned RW regions and
+missed it entirely.
+
+Phases:
+  0. Full pattern in ALL readable regions (.rdata, .data, heap)
+  1. Full pattern in RW regions only
+  2. Relaxed pattern ``[0, 32]`` in RW regions
+  3. key_size marker ``20 00…`` in RW regions
+
+Uses entropy pre-filtering to keep PBKDF2 tractable.
 
 Only runs on Windows.  Requires elevation (admin).
 """
@@ -108,8 +115,30 @@ def _is_likely_key(data: bytes) -> bool:
     return True
 
 
+def _scan_pattern(
+    scanner: WindowsMemoryScanner,
+    regions: list[MemoryRegion],
+    pattern: bytes,
+    max_candidates: int,
+    candidates: list[tuple[bytes, str, int]],
+) -> int:
+    """Scan regions for pattern, extract candidates. Returns match count."""
+    matches = 0
+    for region in regions:
+        for chunk, _ in _read_chunks(scanner, region):
+            for off in _find_all(chunk, pattern):
+                matches += 1
+                for c in _extract_at(chunk, off, scanner):
+                    candidates.append(c)
+                    if len(candidates) >= max_candidates:
+                        return matches
+        if len(candidates) >= max_candidates:
+            return matches
+    return matches
+
+
 class V4BroadScanExtractor(KeyExtractor):
-    """Broad memory scan: multi-pattern, multi-offset, all RW regions."""
+    """Broad memory scan: multi-pattern, multi-offset, all readable regions."""
 
     name = "v4-broad-scan"
     priority = 4
@@ -150,91 +179,78 @@ class V4BroadScanExtractor(KeyExtractor):
 
         scanner = WindowsMemoryScanner(process.pid)
         try:
-            # Collect regions with logging
-            regions: list[MemoryRegion] = []
-            total_size = 0
+            # Phase 0: Full pattern in ALL readable regions (includes .rdata)
+            # The codec descriptor is a compile-time constant in .rdata.
+            all_regions: list[MemoryRegion] = []
+            all_size = 0
+            for r in scanner.iter_readable_all(min_size=4 * 1024):
+                all_regions.append(r)
+                all_size += r.size
+
+            logger.info(
+                f"v4-broad-scan: {len(all_regions)} readable region(s), "
+                f"{all_size / 1024 / 1024:.0f} MB total"
+            )
+
+            p0 = _scan_pattern(
+                scanner, all_regions, _PATTERN_FULL,
+                self._max_candidates, candidates,
+            )
+            logger.info(
+                f"v4-broad-scan: [phase 0: full pattern, all readable] "
+                f"{p0} match(es), {len(candidates)} candidate(s)"
+            )
+
+            # Phase 1-3: RW regions only (for relaxed/marker patterns)
+            rw_regions: list[MemoryRegion] = []
+            rw_size = 0
             for r in scanner.iter_rw_all(min_size=64 * 1024):
-                regions.append(r)
-                total_size += r.size
+                rw_regions.append(r)
+                rw_size += r.size
 
             logger.info(
-                f"v4-broad-scan: {len(regions)} RW region(s), "
-                f"{total_size / 1024 / 1024:.0f} MB total"
+                f"v4-broad-scan: {len(rw_regions)} RW region(s), "
+                f"{rw_size / 1024 / 1024:.0f} MB"
             )
 
-            # Phase 1: Full pattern [0, 32, 47]
-            full_matches = 0
-            for region in regions:
-                for chunk, _ in self._read_chunks(scanner, region):
-                    for off in self._find_all(chunk, _PATTERN_FULL):
-                        full_matches += 1
-                        for c in self._extract_at(chunk, off, scanner):
-                            candidates.append(c)
-                            if len(candidates) >= self._max_candidates:
-                                break
-                        if len(candidates) >= self._max_candidates:
-                            break
-                    if len(candidates) >= self._max_candidates:
-                        break
-                if len(candidates) >= self._max_candidates:
-                    break
-
-            logger.info(
-                f"v4-broad-scan: [full pattern] {full_matches} match(es), "
-                f"{len(candidates)} candidate(s)"
-            )
+            # Phase 1: Full pattern in RW only
+            if len(candidates) < 200:
+                p1 = _scan_pattern(
+                    scanner, rw_regions, _PATTERN_FULL,
+                    self._max_candidates, candidates,
+                )
+                logger.info(
+                    f"v4-broad-scan: [phase 1: full pattern, RW] "
+                    f"{p1} match(es), {len(candidates)} candidate(s)"
+                )
 
             # Phase 2: Relaxed pattern [0, 32]
             if len(candidates) < 200:
-                relaxed_matches = 0
-                for region in regions:
-                    for chunk, _ in self._read_chunks(scanner, region):
-                        for off in self._find_all(chunk, _PATTERN_RELAXED):
-                            relaxed_matches += 1
-                            for c in self._extract_at(chunk, off, scanner):
-                                candidates.append(c)
-                                if len(candidates) >= self._max_candidates:
-                                    break
-                            if len(candidates) >= self._max_candidates:
-                                break
-                        if len(candidates) >= self._max_candidates:
-                            break
-                    if len(candidates) >= self._max_candidates:
-                        break
-
+                p2 = _scan_pattern(
+                    scanner, rw_regions, _PATTERN_RELAXED,
+                    self._max_candidates, candidates,
+                )
                 logger.info(
-                    f"v4-broad-scan: [relaxed pattern] {relaxed_matches} "
-                    f"match(es), total {len(candidates)} candidate(s)"
+                    f"v4-broad-scan: [phase 2: relaxed pattern] "
+                    f"{p2} match(es), {len(candidates)} candidate(s)"
                 )
 
-            # Phase 3: key_size marker search (layout-agnostic)
+            # Phase 3: key_size marker
             if len(candidates) < 200:
-                ks_matches = 0
-                for region in regions:
-                    for chunk, _ in self._read_chunks(scanner, region):
-                        for off in self._find_all(chunk, _KEYSIZE_MARKER):
-                            ks_matches += 1
-                            for c in self._extract_at(chunk, off, scanner):
-                                candidates.append(c)
-                                if len(candidates) >= self._max_candidates:
-                                    break
-                            if len(candidates) >= self._max_candidates:
-                                break
-                        if len(candidates) >= self._max_candidates:
-                            break
-                    if len(candidates) >= self._max_candidates:
-                        break
-
+                p3 = _scan_pattern(
+                    scanner, rw_regions, _KEYSIZE_MARKER,
+                    self._max_candidates, candidates,
+                )
                 logger.info(
-                    f"v4-broad-scan: [key_size marker] {ks_matches} "
-                    f"match(es), total {len(candidates)} candidate(s)"
+                    f"v4-broad-scan: [phase 3: key_size marker] "
+                    f"{p3} match(es), {len(candidates)} candidate(s)"
                 )
         finally:
             scanner.close()
 
         if not candidates:
             raise NoValidKeyError(
-                "v4-broad-scan: no candidates found in any RW memory region."
+                "v4-broad-scan: no candidates found in any memory region."
             )
 
         # Deduplicate
@@ -278,58 +294,59 @@ class V4BroadScanExtractor(KeyExtractor):
             f"v4-broad-scan: {len(unique)} unique candidate(s), none matched."
         )
 
-    # --- helpers ----------------------------------------------------------
 
-    @staticmethod
-    def _read_chunks(
-        scanner: WindowsMemoryScanner,
-        region: MemoryRegion,
-    ) -> Iterator[tuple[bytes, int]]:
-        pos = 0
-        while pos < region.size:
-            end = min(pos + _CHUNK, region.size)
-            chunk = scanner.read(region.base + pos, end - pos)
-            if chunk is not None:
-                yield chunk, pos
-            pos = (end - _OVERLAP) if end < region.size else end
+# --- module-level helpers ---------------------------------------------------
 
-    @staticmethod
-    def _find_all(data: bytes, pattern: bytes) -> Iterator[int]:
-        idx = 0
-        while True:
-            idx = data.find(pattern, idx)
-            if idx == -1:
-                break
-            yield idx
-            idx += 1
 
-    @staticmethod
-    def _extract_at(
-        chunk: bytes,
-        match_off: int,
-        scanner: WindowsMemoryScanner,
-    ) -> Iterator[tuple[bytes, str, int]]:
-        """Extract candidates from one pattern match."""
-        # Pointer dereference
-        for off in PTR_OFFSETS:
-            p = match_off + off
-            if p < 0 or p + 8 > len(chunk):
-                continue
-            try:
-                (ptr_val,) = struct.unpack_from("<Q", chunk, p)
-            except struct.error:
-                continue
-            if not (MIN_PTR < ptr_val < MAX_PTR):
-                continue
-            key = scanner.read(ptr_val, SQLCIPHER_KEY_SIZE)
-            if key and len(key) == SQLCIPHER_KEY_SIZE and _is_likely_key(key):
-                yield key, f"ptr@{off}", off
+def _read_chunks(
+    scanner: WindowsMemoryScanner,
+    region: MemoryRegion,
+) -> Iterator[tuple[bytes, int]]:
+    pos = 0
+    while pos < region.size:
+        end = min(pos + _CHUNK, region.size)
+        chunk = scanner.read(region.base + pos, end - pos)
+        if chunk is not None:
+            yield chunk, pos
+        pos = (end - _OVERLAP) if end < region.size else end
 
-        # Inline read
-        for off in INLINE_OFFSETS:
-            p = match_off + off
-            if p < 0 or p + SQLCIPHER_KEY_SIZE > len(chunk):
-                continue
-            key = chunk[p : p + SQLCIPHER_KEY_SIZE]
-            if len(key) == SQLCIPHER_KEY_SIZE and _is_likely_key(key):
-                yield key, f"inline@{off}", off
+
+def _find_all(data: bytes, pattern: bytes) -> Iterator[int]:
+    idx = 0
+    while True:
+        idx = data.find(pattern, idx)
+        if idx == -1:
+            break
+        yield idx
+        idx += 1
+
+
+def _extract_at(
+    chunk: bytes,
+    match_off: int,
+    scanner: WindowsMemoryScanner,
+) -> Iterator[tuple[bytes, str, int]]:
+    """Extract candidates from one pattern match."""
+    # Pointer dereference
+    for off in PTR_OFFSETS:
+        p = match_off + off
+        if p < 0 or p + 8 > len(chunk):
+            continue
+        try:
+            (ptr_val,) = struct.unpack_from("<Q", chunk, p)
+        except struct.error:
+            continue
+        if not (MIN_PTR < ptr_val < MAX_PTR):
+            continue
+        key = scanner.read(ptr_val, SQLCIPHER_KEY_SIZE)
+        if key and len(key) == SQLCIPHER_KEY_SIZE and _is_likely_key(key):
+            yield key, f"ptr@{off}", off
+
+    # Inline read
+    for off in INLINE_OFFSETS:
+        p = match_off + off
+        if p < 0 or p + SQLCIPHER_KEY_SIZE > len(chunk):
+            continue
+        key = chunk[p : p + SQLCIPHER_KEY_SIZE]
+        if len(key) == SQLCIPHER_KEY_SIZE and _is_likely_key(key):
+            yield key, f"inline@{off}", off
