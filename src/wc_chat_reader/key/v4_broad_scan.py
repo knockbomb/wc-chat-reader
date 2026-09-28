@@ -184,20 +184,38 @@ class V4BroadScanExtractor(KeyExtractor):
         process: WeChatProcess,
         sample_db_path: Path | None = None,
     ) -> KeyResult:
-        if sample_db_path is None:
-            from wc_chat_reader.key._memory_base import _find_sample_db
-            sample_db_path = _find_sample_db(process, WeChatVersion.V4)
-        if sample_db_path is None:
+        # Collect candidate DBs for multi-file validation
+        db_paths: list[Path] = []
+        if sample_db_path is not None:
+            db_paths.append(sample_db_path)
+        else:
+            from wc_chat_reader.key._memory_base import _find_all_sample_dbs
+            db_paths = _find_all_sample_dbs(process, WeChatVersion.V4)
+
+        if not db_paths:
             raise KeyExtractionError(
                 "V4BroadScanExtractor requires a sample_db_path for validation"
             )
 
-        validator = KeyValidator(sample_db_path, process.version)
+        # Build validators for all available DBs
+        validators: list[tuple[Path, KeyValidator]] = []
+        for db in db_paths[:5]:  # limit to 5 to avoid excessive file I/O
+            try:
+                validators.append((db, KeyValidator(db, process.version)))
+            except Exception as exc:
+                logger.debug(f"v4-broad-scan: skip {db.name}: {exc}")
+
+        if not validators:
+            raise KeyExtractionError(
+                f"V4BroadScanExtractor: no valid SQLCipher DBs found "
+                f"among {len(db_paths)} candidate(s)"
+            )
+
         candidates: list[tuple[bytes, str, int]] = []
 
         logger.info(
             f"v4-broad-scan: starting (pid={process.pid}, "
-            f"sample_db={sample_db_path})"
+            f"{len(validators)} DB(s) for validation)"
         )
 
         scanner = WindowsMemoryScanner(process.pid)
@@ -274,25 +292,27 @@ class V4BroadScanExtractor(KeyExtractor):
             f"(from {len(candidates)} total)"
         )
 
-        # Validate
+        # Validate against ALL DBs — first match wins
         for i, (key, strat, off) in enumerate(unique):
-            if validator.validate(key):
-                logger.info(
-                    f"v4-broad-scan: valid key! strategy={strat}, "
-                    f"offset={off}, after {i + 1} validation(s)"
-                )
-                return KeyResult(
-                    key=key,
-                    strategy=self.name,
-                    candidates_scanned=i + 1,
-                    meta={
-                        "db_path": str(sample_db_path),
-                        "version": process.version_str,
-                        "extraction_strategy": strat,
-                        "extraction_offset": off,
-                        "total_unique": len(unique),
-                    },
-                )
+            for db_path, validator in validators:
+                if validator.validate(key):
+                    logger.info(
+                        f"v4-broad-scan: valid key! strategy={strat}, "
+                        f"offset={off}, db={db_path.name}, "
+                        f"after {i + 1} validation(s)"
+                    )
+                    return KeyResult(
+                        key=key,
+                        strategy=self.name,
+                        candidates_scanned=i + 1,
+                        meta={
+                            "db_path": str(db_path),
+                            "version": process.version_str,
+                            "extraction_strategy": strat,
+                            "extraction_offset": off,
+                            "total_unique": len(unique),
+                        },
+                    )
             if (i + 1) % 100 == 0:
                 logger.debug(
                     f"v4-broad-scan: validated {i + 1}/{len(unique)}"

@@ -55,6 +55,9 @@ logger = get_logger(__name__)
 _PATTERN_HEX = "00 00 00 00 00 00 00 00 20 00 00 00 00 00 00 00"
 
 # Frida script: scan RW heap for [0, 32], read ptr@-8, send (match_addr, ptr).
+# CRITICAL: Memory.scan is ASYNC — onComplete fires after all onMatch for that
+# range, but multiple ranges scan concurrently.  We must track pending ranges
+# and only send 'done' after the LAST range's onComplete fires.
 _FRIDA_SCAN_SCRIPT = r"""
 (function () {
     'use strict';
@@ -68,35 +71,52 @@ _FRIDA_SCAN_SCRIPT = r"""
     send({tag: 'start'});
 
     var ranges = Process.enumerateRanges('rw-');
-    ranges.forEach(function (range) {
-        if (range.size < 64 * 1024) return;
-        try {
-            Memory.scan(range.base, range.size, PATTERN, {
-                onMatch: function (address, size) {
-                    matches++;
-                    try {
-                        var ptrAddr = address.add(PTR_OFFSET);
-                        var ptr = ptrAddr.readPointer();
-                        if (ptr >= MIN_PTR && ptr <= MAX_PTR) {
-                            sent++;
-                            send({
-                                tag: 'match',
-                                matchAddr: address.toString(),
-                                ptrValue: ptr.toString(),
-                            });
-                        }
-                    } catch (e) {}
-                },
-                onComplete: function () {}
-            });
-        } catch (e) {}
-    });
+    var queue = [];
+    for (var i = 0; i < ranges.length; i++) {
+        if (ranges[i].size >= 64 * 1024) queue.push(ranges[i]);
+    }
 
-    send({
-        tag: 'done',
-        matches: matches,
-        candidates: sent,
-    });
+    if (queue.length === 0) {
+        send({tag: 'done', matches: 0, candidates: 0});
+        return;
+    }
+
+    var pending = queue.length;
+
+    for (var i = 0; i < queue.length; i++) {
+        (function (range) {
+            try {
+                Memory.scan(range.base, range.size, PATTERN, {
+                    onMatch: function (address, size) {
+                        matches++;
+                        try {
+                            var ptrAddr = address.add(PTR_OFFSET);
+                            var ptr = ptrAddr.readPointer();
+                            if (ptr >= MIN_PTR && ptr <= MAX_PTR) {
+                                sent++;
+                                send({
+                                    tag: 'match',
+                                    matchAddr: address.toString(),
+                                    ptrValue: ptr.toString(),
+                                });
+                            }
+                        } catch (e) {}
+                    },
+                    onComplete: function () {
+                        pending--;
+                        if (pending === 0) {
+                            send({tag: 'done', matches: matches, candidates: sent});
+                        }
+                    }
+                });
+            } catch (e) {
+                pending--;
+                if (pending === 0) {
+                    send({tag: 'done', matches: matches, candidates: sent});
+                }
+            }
+        })(queue[i]);
+    }
 })();
 """ % {"pattern_q": '"%s"' % _PATTERN_HEX}
 

@@ -217,8 +217,20 @@ def _find_sample_db(
     process: WeChatProcess, version: WeChatVersion
 ) -> Path | None:
     """Locate a sample encrypted database file inside the user's data dir."""
+    dbs = _find_all_sample_dbs(process, version)
+    return dbs[0] if dbs else None
+
+
+def _find_all_sample_dbs(
+    process: WeChatProcess, version: WeChatVersion
+) -> list[Path]:
+    """Return ALL candidate encrypted database files for validation.
+
+    Multiple DBs allow the validator to try each one — if the user switched
+    accounts or a DB was recreated, we still find the right one.
+    """
     if process.data_dir is None:
-        return None
+        return []
 
     if version == WeChatVersion.V3:
         preferred = ("MicroMsg.db", "MSG0.db")
@@ -227,19 +239,25 @@ def _find_sample_db(
     else:
         preferred = ()
 
+    found: list[Path] = []
+    seen: set[Path] = set()
+
     for name in preferred:
         for p in process.data_dir.rglob(name):
             try:
-                if p.is_file() and p.stat().st_size > 4096:
-                    return p
+                if p.is_file() and p.stat().st_size > 4096 and p not in seen:
+                    found.append(p)
+                    seen.add(p)
             except OSError:
                 continue
 
     # Fallback: walk the data_dir looking for any .db file large enough.
     for p in process.data_dir.rglob("*.db"):
         try:
-            if p.is_file() and p.stat().st_size > 4096:
-                return p
+            if p.is_file() and p.stat().st_size > 4096 and p not in seen:
+                found.append(p)
+                seen.add(p)
         except OSError:
             continue
-    return None
+
+    return found
