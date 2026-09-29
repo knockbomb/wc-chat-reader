@@ -43,7 +43,7 @@ from wc_chat_reader.core.exceptions import (
 from wc_chat_reader.core.logger import get_logger
 from wc_chat_reader.key.base import KeyExtractor, KeyResult
 from wc_chat_reader.key.memory_scanner import WindowsMemoryScanner
-from wc_chat_reader.key.validator import KeyValidator
+from wc_chat_reader.key.multi_validator import MultiValidator
 
 if TYPE_CHECKING:
     from wc_chat_reader.key.memory_scanner import MemoryRegion
@@ -198,10 +198,10 @@ class V4BroadScanExtractor(KeyExtractor):
             )
 
         # Build validators for all available DBs
-        validators: list[tuple[Path, KeyValidator]] = []
+        validators: list[tuple[Path, MultiValidator]] = []
         for db in db_paths[:5]:  # limit to 5 to avoid excessive file I/O
             try:
-                validators.append((db, KeyValidator(db, process.version)))
+                validators.append((db, MultiValidator(db)))
             except Exception as exc:
                 logger.debug(f"v4-broad-scan: skip {db.name}: {exc}")
 
@@ -295,10 +295,12 @@ class V4BroadScanExtractor(KeyExtractor):
         # Validate against ALL DBs — first match wins
         for i, (key, strat, off) in enumerate(unique):
             for db_path, validator in validators:
-                if validator.validate(key):
+                ok, label = validator.validate(key)
+                if ok:
                     logger.info(
                         f"v4-broad-scan: valid key! strategy={strat}, "
                         f"offset={off}, db={db_path.name}, "
+                        f"label={label}, "
                         f"after {i + 1} validation(s)"
                     )
                     return KeyResult(

@@ -16,7 +16,7 @@ from wc_chat_reader.core.exceptions import (
 from wc_chat_reader.core.logger import get_logger
 from wc_chat_reader.key.base import KeyExtractor, KeyResult
 from wc_chat_reader.key.memory_scanner import WindowsMemoryScanner, open_scanner
-from wc_chat_reader.key.validator import KeyValidator
+from wc_chat_reader.key.multi_validator import MultiValidator
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -68,7 +68,7 @@ class _BaseMemoryExtractor(KeyExtractor):
                 f"WeChat may not be fully logged in yet."
             )
 
-        validator = KeyValidator(db_path, self._params.version)
+        validator = MultiValidator(db_path)
         candidates_scanned = 0
 
         logger.info(
@@ -79,10 +79,11 @@ class _BaseMemoryExtractor(KeyExtractor):
         with open_scanner(process.pid) as scanner:
             for candidate in self._iter_candidates(scanner):
                 candidates_scanned += 1
-                if validator.validate(candidate):
+                ok, label = validator.validate(candidate)
+                if ok:
                     logger.info(
                         f"{self.name}: valid key found after "
-                        f"{candidates_scanned} candidate(s)"
+                        f"{candidates_scanned} candidate(s), config={label}"
                     )
                     return KeyResult(
                         key=candidate,

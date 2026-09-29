@@ -44,7 +44,7 @@ from wc_chat_reader.core.exceptions import (
 from wc_chat_reader.core.logger import get_logger
 from wc_chat_reader.key.base import KeyExtractor, KeyResult
 from wc_chat_reader.key.memory_scanner import WindowsMemoryScanner, open_scanner
-from wc_chat_reader.key.validator import KeyValidator
+from wc_chat_reader.key.multi_validator import MultiValidator
 
 if TYPE_CHECKING:
     from wc_chat_reader.wechat.process_detector import WeChatProcess
@@ -187,7 +187,7 @@ class FridaHybridExtractor(KeyExtractor):
                 "FridaHybridExtractor requires a sample_db_path for validation"
             )
 
-        validator = KeyValidator(sample_db_path, process.version)
+        validator = MultiValidator(sample_db_path)
 
         # Phase 1: Frida fast scan — collect (match_addr, ptr_value) pairs
         candidates: list[_PtrCandidate] = []
@@ -271,10 +271,12 @@ class FridaHybridExtractor(KeyExtractor):
                 key = scanner.read(cand.ptr_value, SQLCIPHER_KEY_SIZE)
                 if key is None or len(key) != SQLCIPHER_KEY_SIZE:
                     continue
-                if validator.validate(key):
+                ok, label = validator.validate(key)
+                if ok:
                     logger.info(
                         f"FridaHybrid: valid key! ptr=0x{cand.ptr_value:x}, "
-                        f"match={cand.match_addr}, after {i + 1} validation(s)"
+                        f"match={cand.match_addr}, config={label}, "
+                        f"after {i + 1} validation(s)"
                     )
                     return KeyResult(
                         key=key,
